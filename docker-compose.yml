@@ -1,7 +1,10 @@
+# Echo fork: github.com/weareecho/linki (from moaljumaa/linki).
+# Default uses the published image for a fast first boot. Switch to `build: .`
+# when you change Linki source under this directory.
 services:
   linki:
     image: moaljumaa/linki:latest
-    # To build from source instead: comment out image above and uncomment below
+    # To build from this fork instead: comment out image above and uncomment:
     # build: .
     ports:
       - "127.0.0.1:${PORT:-3456}:3000"
@@ -14,21 +17,8 @@ services:
       # Runtime — always set by compose, do not put in .env.local
       - NODE_ENV=production
       - LINKI_DB_PATH=/data/linki.db
-
-      # --- copy the block below into .env.local and fill in values ---
-      #
-      # Public URL of the app (used by NextAuth for redirects)
-      # NEXTAUTH_URL=
-      #
-      # Random secret for NextAuth session signing
-      # Generate with: openssl rand -base64 32
-      # NEXTAUTH_SECRET=
-      #
-      # Password to log in to the Linki UI
-      # AUTH_PASSWORD=
-      #
-      # Set to "false" to show the browser during automation (debug only)
-      # HEADLESS=true
+      # Echo bridge: INTERNAL_API_SECRET must be set in .env.local so
+      # `echoctl linki-check` / `linki-push` can call /api/* over loopback.
 
     restart: unless-stopped
     # Caps Linki's CPU so a busy runner can't starve other containers on a
