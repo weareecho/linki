@@ -3,6 +3,7 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { scheduleUpdateCheck } from "@/lib/update-check";
 import { encryptSecret, isEncrypted } from "@/lib/crypto";
+import { registerLoginEmailNormalizer } from "@/lib/auth-email";
 
 const DB_PATH = process.env.LINKI_DB_PATH || path.join(process.cwd(), "linki.db");
 
@@ -11,6 +12,7 @@ let db: Database.Database;
 export function getDb(): Database.Database {
   if (!db) {
     db = new Database(DB_PATH);
+    registerLoginEmailNormalizer(db);
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     initDb(db);
