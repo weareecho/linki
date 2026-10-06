@@ -3,6 +3,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
+import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
 
 chromium.use(StealthPlugin());
 
@@ -64,17 +65,18 @@ async function getOrCreateContext(accountId: string): Promise<BrowserContext> {
   if (!account) throw new Error(`Account ${accountId} not found`);
 
   if (!contexts.has(accountId)) {
-    const b = await getBrowser();
-
-    let storageState: object | undefined;
+    let storageState: unknown;
     if (account.cookies_json) {
       try {
-        storageState = JSON.parse(decryptSecret(account.cookies_json)!);
+        storageState = normalizeLegacyLinkedInState(JSON.parse(decryptSecret(account.cookies_json)!));
       } catch {
-        // Invalid storage state — will need re-auth
+        // Fail closed: never navigate with an empty context after decryption failure.
+        throw new LinkedInSessionUnavailableError();
       }
     }
 
+    if (!hasUsableLinkedInState(storageState)) throw new LinkedInSessionUnavailableError();
+    const b = await getBrowser();
     const ctx = await b.newContext(contextOptions(storageState));
 
     // Auto-evict from map when context closes for any reason (crash, session expiry, etc.)
@@ -90,7 +92,8 @@ async function getOrCreateContext(accountId: string): Promise<BrowserContext> {
 export async function getSessionContext(accountId: string): Promise<BrowserContext> {
   try {
     return await getOrCreateContext(accountId);
-  } catch {
+  } catch (error) {
+    if (error instanceof LinkedInSessionUnavailableError) throw error;
     // First attempt failed — evict and retry once with a fresh context
     contexts.delete(accountId);
     return getOrCreateContext(accountId);
@@ -165,6 +168,7 @@ export async function saveSessionState(accountId: string): Promise<void> {
   if (!ctx) return;
   const db = getDb();
   const state = await ctx.storageState();
+  if (!hasUsableLinkedInState(state)) throw new LinkedInSessionUnavailableError();
   db.prepare("UPDATE accounts SET cookies_json = ?, is_authenticated = 1 WHERE id = ?").run(
     encryptSecret(JSON.stringify(state)),
     accountId
@@ -243,6 +247,9 @@ export async function authenticateAccount(accountId: string): Promise<void> {
 
     // Save full storage state (cookies + localStorage) to DB
     const state = await ctx.storageState();
+    if (!hasUsableLinkedInState(state) || !await hasSignedInLinkedInEvidence(page)) {
+      throw new LinkedInSessionUnavailableError();
+    }
     db.prepare("UPDATE accounts SET cookies_json = ?, is_authenticated = 1 WHERE id = ?").run(
       encryptSecret(JSON.stringify(state)),
       accountId
@@ -292,31 +299,14 @@ function sweepPendingLogins(): void {
   }
 }
 
-/**
- * Warm the freshly-authenticated session by loading Sales Navigator once, THEN
- * persist. The bare login POST lands on /feed and only mints the ~11 core
- * LinkedIn cookies — it does NOT yet include the Sales Nav SEAT cookie
- * (li_ep_auth_context) nor the secondary auth tokens (li_a, liap) and
- * localStorage. Those are only issued once the browser actually enters Sales
- * Navigator. Without the seat cookie every Sales Nav API call returns nothing
- * ("no intercept after 15s" → import fails → account wrongly flagged
- * needs-reauth). So we navigate to /sales/ and wait for it to settle before
- * calling storageState(), capturing the FULL session the runner needs.
- * Best-effort: if the account has no Sales Nav seat the nav simply doesn't add
- * the seat cookie — the rest of the (regular-LinkedIn) session is still saved.
+/** Save the verified regular LinkedIn session before any optional Sales Nav access.
+ * A Sales Nav seat is not required for ordinary connections; warming it during
+ * login can replace usable regular cookies with a guest/challenge state.
  */
-async function persistLogin(accountId: string, ctx: BrowserContext, page?: Page): Promise<void> {
-  if (page) {
-    try {
-      await page.goto("https://www.linkedin.com/sales/home", { waitUntil: "domcontentloaded", timeout: 30_000 });
-      // Let Sales Nav's bootstrap requests fire so li_ep_auth_context is set.
-      await page.waitForTimeout(4_000);
-    } catch {
-      // Non-fatal — a missing seat / slow load must not fail the whole login.
-    }
-  }
+async function persistLogin(accountId: string, ctx: BrowserContext): Promise<void> {
   const db = getDb();
   const state = await ctx.storageState();
+  if (!hasUsableLinkedInState(state)) throw new LinkedInSessionUnavailableError();
   db.prepare("UPDATE accounts SET cookies_json = ?, is_authenticated = 1 WHERE id = ?").run(
     encryptSecret(JSON.stringify(state)),
     accountId
@@ -337,8 +327,11 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
   while (Date.now() < deadline) {
     const url = page.url();
     if (/\/feed\//.test(url) || /linkedin\.com\/sales\//.test(url)) {
-      return { status: "authenticated" };
+      if (await hasSignedInLinkedInEvidence(page)) return { status: "authenticated" };
+      // DOMContentLoaded can precede signed-in navigation hydration. Observe
+      // within this deadline without resubmitting login or navigating elsewhere.
     }
+    if (loginLocation(url) === "/authwall") return { status: "error", message: "LinkedIn access requires verification. Stop and use LinkedIn's normal owner flow." };
 
     // Email/SMS PIN entry
     const pin = page.locator(PIN_SELECTOR).first();
@@ -357,7 +350,7 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
         return {
           status: "challenge",
           kind: "captcha",
-          message: "LinkedIn requires a CAPTCHA, which can't be solved on the server. Use cookie paste instead.",
+          message: "LinkedIn requires a CAPTCHA. Stop automation and resolve it through LinkedIn's normal owner flow; do not transfer cookies to bypass it.",
         };
       }
       // Device/app approval: a settled checkpoint with no code input and no captcha
@@ -387,7 +380,7 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
       message: "LinkedIn presented a security checkpoint. If you got a code enter it; if it's an app request, approve it and click Continue.",
     };
   }
-  return { status: "error", message: `Login did not complete. Current page: ${page.url()}` };
+  return { status: "error", message: "Login did not complete. Resolve any verification through LinkedIn before trying Server login again." };
 }
 
 export async function startHeadlessLogin(
@@ -416,9 +409,9 @@ export async function startHeadlessLogin(
     ]);
 
     const result = await classifyLoginState(page);
-    console.log(`[login] start account=${accountId} -> ${result.status}${"kind" in result ? "/" + result.kind : ""} url=${page.url()}`);
+    console.log(`[login] start account=${accountId} -> ${result.status}${"kind" in result ? "/" + result.kind : ""} location=${loginLocation(page.url())}`);
     if (result.status === "authenticated") {
-      await persistLogin(accountId, ctx, page);
+      await persistLogin(accountId, ctx);
       await ctx.close();
       return result;
     }
@@ -428,10 +421,10 @@ export async function startHeadlessLogin(
     }
     await ctx.close();
     return result;
-  } catch (e) {
-    console.log(`[login] start account=${accountId} ERROR ${(e as Error).message} url=${page.url()}`);
+  } catch {
+    console.log(`[login] start account=${accountId} ERROR location=${loginLocation(page.url())}`);
     try { await ctx.close(); } catch { /* ignore */ }
-    return { status: "error", message: (e as Error).message };
+    return { status: "error", message: "LinkedIn login failed. Complete any verification through LinkedIn before trying again." };
   }
 }
 
@@ -450,9 +443,9 @@ export async function submitLoginChallenge(accountId: string, code: string): Pro
     ]);
 
     const result = await classifyLoginState(page);
-    console.log(`[login] verify account=${accountId} -> ${result.status}${"kind" in result ? "/" + result.kind : ""} url=${page.url()}`);
+    console.log(`[login] verify account=${accountId} -> ${result.status}${"kind" in result ? "/" + result.kind : ""} location=${loginLocation(page.url())}`);
     if (result.status === "authenticated") {
-      await persistLogin(accountId, ctx, page);
+      await persistLogin(accountId, ctx);
       await clearPendingLogin(accountId);
       return result;
     }
@@ -464,9 +457,9 @@ export async function submitLoginChallenge(accountId: string, code: string): Pro
     return result.status === "error"
       ? result
       : { status: "error", message: "Code rejected or login failed." };
-  } catch (e) {
+  } catch {
     await clearPendingLogin(accountId);
-    return { status: "error", message: (e as Error).message };
+    return { status: "error", message: "LinkedIn login failed. Complete any verification through LinkedIn before trying again." };
   }
 }
 
@@ -500,9 +493,9 @@ export async function awaitLoginApproval(accountId: string): Promise<LoginResult
     }
 
     const result = await classifyLoginState(page);
-    console.log(`[login] await account=${accountId} -> ${result.status}${"kind" in result ? "/" + result.kind : ""} url=${page.url()}`);
+    console.log(`[login] await account=${accountId} -> ${result.status}${"kind" in result ? "/" + result.kind : ""} location=${loginLocation(page.url())}`);
     if (result.status === "authenticated") {
-      await persistLogin(accountId, ctx, page);
+      await persistLogin(accountId, ctx);
       await clearPendingLogin(accountId);
       return result;
     }
@@ -512,8 +505,8 @@ export async function awaitLoginApproval(accountId: string): Promise<LoginResult
     }
     await clearPendingLogin(accountId);
     return result;
-  } catch (e) {
+  } catch {
     await clearPendingLogin(accountId);
-    return { status: "error", message: (e as Error).message };
+    return { status: "error", message: "LinkedIn login failed. Complete any verification through LinkedIn before trying again." };
   }
 }

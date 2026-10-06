@@ -275,12 +275,12 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
     setAuthLoading(false);
     if (!res.ok) { toast.error(data.error ?? "Login failed"); return; }
     if (data.status === "authenticated") {
-      toast.success("Logged in successfully");
+      toast.success("LinkedIn session saved; live access and identity must be checked before outreach");
       closeAuthModal();
       refresh();
     } else if (data.status === "challenge" && data.kind === "captcha") {
       toast.error(data.message);
-      setAuthMode("cookies");
+      // Stop at the challenge; never suggest transferring cookies as a bypass.
     } else if (data.status === "challenge") {
       setChallengeMsg(data.message ?? "");
       if (data.kind === "app") {
@@ -404,7 +404,7 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
                   </span>
                 ) : null}
                 <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium ${a.is_authenticated ? "bg-success/15 text-success" : "bg-base-300 text-base-content/40"}`}>
-                  {a.is_authenticated ? <><RiCheckLine size={10} /> Auth</> : "Unauth"}
+                  {a.is_authenticated ? <><RiCheckLine size={10} /> Saved</> : "No session"}
                 </span>
                 <button
                   className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 transition-colors"
