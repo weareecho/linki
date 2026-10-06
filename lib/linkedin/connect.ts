@@ -50,12 +50,28 @@ function inviteMatchesTarget(value: string, slug: string): boolean {
 }
 
 async function exactProfileCard(page: Page, slug: string): Promise<Locator> {
-  if (profileSlug(page.url()) !== slug) throw new TargetProfileMismatchError("Exact target profile was not reached; stop.");
   const heading = page.locator("main h1");
-  if (await heading.count() !== 1) throw new TargetProfileMismatchError("Target profile heading is ambiguous or absent; stop.");
   const card = heading.locator("xpath=ancestor::section[1]");
-  if (await card.count() !== 1) throw new TargetProfileMismatchError("Target profile card is absent; stop.");
+  const ready = await observeRendering(page, async () => {
+    if (profileSlug(page.url()) !== slug) throw new TargetProfileMismatchError("Exact target profile was not reached; stop.");
+    if (await heading.count() > 1 || await card.count() > 1) throw new TargetProfileMismatchError("Target profile is ambiguous; stop.");
+    return await heading.count() === 1 && await card.count() === 1 &&
+      await heading.isVisible() && (await heading.innerText()).trim().length > 0;
+  });
+  if (!ready) throw new TargetProfileMismatchError("Target profile card did not render; stop.");
   return card;
+}
+
+// Observe asynchronous DOM rendering, never repeat a click/navigation. Provider
+// rejection and ambiguity still stop immediately; expiration never means success.
+async function observeRendering(page: Page, ready: () => Promise<boolean>): Promise<boolean> {
+  const deadline = Date.now() + 5000;
+  do {
+    await assertNoProviderRejection(page);
+    if (await ready()) return true;
+    await page.waitForTimeout(100);
+  } while (Date.now() < deadline);
+  return false;
 }
 
 async function isPending(card: Locator): Promise<boolean> {
@@ -122,7 +138,10 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
         const menu = controls && /^[a-zA-Z0-9:_-]+$/.test(controls)
           ? page.locator(`[id="${controls}"]`)
           : card.getByRole("menu");
-        if (await menu.count() !== 1) throw new TargetProfileMismatchError("Cannot associate menu with the target; stop.");
+        if (!await observeRendering(page, async () => {
+          if (await menu.count() > 1) throw new TargetProfileMismatchError("Target menu is ambiguous; stop.");
+          return await menu.count() === 1 && await menu.isVisible();
+        })) throw new TargetProfileMismatchError("Cannot associate menu with the target; stop.");
         if (await menu.getByRole("menuitem", { name: /Pending/ }).count() > 0) throw new PendingInviteError("Invitation already pending");
         const item = menu.getByRole("menuitem", { name: "Connect", exact: true });
         if (await item.count() !== 1) throw new TargetProfileMismatchError("Target menu Connect action is absent or ambiguous; stop.");
@@ -132,16 +151,29 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
       }
     }
 
-    await assertNoProviderRejection(page);
     const dialogs = page.getByRole("dialog");
-    if (await dialogs.count() !== 1) throw new InvitationOutcomeUnknownError(sendAttempted);
+    if (!await observeRendering(page, async () => {
+      if (await dialogs.count() > 1) throw new TargetProfileMismatchError("Ambiguous invitation dialogs; stop.");
+      return await dialogs.count() === 1 && await dialogs.first().isVisible();
+    })) throw new InvitationOutcomeUnknownError(sendAttempted);
     const dialog = dialogs.first();
     // The explicit recipient name is mandatory before the final send click.
-    if (await dialog.getByText(name, { exact: true }).count() !== 1) {
+    const recipient = dialog.getByText(name, { exact: true });
+    if (!await observeRendering(page, async () => {
+      if (await dialogs.count() !== 1 || await recipient.count() > 1) throw new TargetProfileMismatchError("Ambiguous invitation recipient; stop.");
+      return await recipient.count() === 1 && await recipient.isVisible();
+    })) {
       throw new TargetProfileMismatchError("Invitation dialog recipient is not verified; stop.");
     }
     const send = dialog.getByRole("button", { name: /^(Send without a note|Send now)$/ });
-    if (await send.count() !== 1) throw new InvitationOutcomeUnknownError(sendAttempted);
+    if (!await observeRendering(page, async () => {
+      if (await dialogs.count() !== 1 || await send.count() > 1 || await recipient.count() !== 1) throw new TargetProfileMismatchError("Invitation recipient or controls changed; stop.");
+      return await send.count() === 1 && await send.isVisible() && await send.isEnabled();
+    })) throw new InvitationOutcomeUnknownError(sendAttempted);
+    await assertNoProviderRejection(page);
+    if (await dialogs.count() !== 1 || await recipient.count() !== 1 || !await recipient.isVisible() || await send.count() !== 1) {
+      throw new TargetProfileMismatchError("Invitation recipient or controls changed before Send; stop.");
+    }
     await fence();
     sendAttempted = true; // Set before click: even a timeout may have sent it.
     await send.click();
@@ -153,7 +185,10 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     const observed = await page.goto(linkedinUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     if (!observed || observed.status() >= 400) throw new InvitationOutcomeUnknownError(true);
     const observedCard = await exactProfileCard(page, slug);
-    if (!await isPending(observedCard)) throw new InvitationOutcomeUnknownError(true);
+    if (!await observeRendering(page, async () => {
+      if (profileSlug(page.url()) !== slug) throw new TargetProfileMismatchError("Post-send profile changed; stop.");
+      return await isPending(observedCard);
+    })) throw new InvitationOutcomeUnknownError(true);
   } catch (error) {
     if (error instanceof WeeklyLimitError || error instanceof AlreadyConnectedError || error instanceof PendingInviteError || error instanceof InvitationOutcomeUnknownError) throw error;
     if (sendAttempted) throw new InvitationOutcomeUnknownError(true);

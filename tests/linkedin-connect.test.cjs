@@ -8,8 +8,8 @@ const {DatabaseSync}=require('node:sqlite');
 let api,browser,context,page,state;
 const target='https://www.linkedin.com/in/target-fixture';
 const invite='/preload/custom-invite/?vanityName=target-fixture';
-function dialog(){return `${state.weeklyLimit?'<div class="ip-fuse-limit-alert__warning">Synthetic weekly limit</div>':''}<div role="dialog"><p>${state.wrongDialog?'Other Fixture':'Target Fixture'}</p>${state.missingSend?'':`<button onclick="window.fixtureSent().then(()=>this.closest('[role=dialog]').remove())">Send without a note</button>`}</div>`;}
-function profile(){return `<aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other first</a></aside><main><section><h1>Target Fixture</h1>${state.pending?'<button aria-label="Pending">Pending</button>':state.connected?'<span>1st</span>':'<span>2nd</span>'}${state.more?`<button aria-label="More" aria-controls="own-menu" onclick="document.querySelector('#own-menu').hidden=false">More</button><div role="menu" id="own-menu" hidden><button role="menuitem" onclick="document.body.insertAdjacentHTML('beforeend',window.dialogHtml)">Connect</button></div>`:`<a aria-label="Invite Target Fixture to connect" href="${state.wrongLink?'/preload/custom-invite/?vanityName=other-fixture':invite}">Connect</a>`}</section><aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other Connect</a><button aria-label="Pending">Pending</button><button aria-label="More">More</button></aside></main>`;}
+function dialog(){return `${state.weeklyLimit?'<div class="ip-fuse-limit-alert__warning">Synthetic weekly limit</div>':''}<div role="dialog"><p id="fixture-recipient">${state.recipientDelay?'':state.wrongDialog?'Other Fixture':'Target Fixture'}</p>${state.missingSend?'':`<button data-fixture-send ${state.sendDelay?'hidden':''} onclick="window.fixtureSent().then(()=>this.closest('[role=dialog]').remove())">Send without a note</button>`}</div>`;}
+function profile(){return `<aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other first</a></aside><main><section><h1>Target Fixture</h1>${state.pending&&!state.pendingDelay?'<button aria-label="Pending">Pending</button>':state.connected?'<span>1st</span>':'<span>2nd</span>'}${state.more?`<button aria-label="More" aria-controls="own-menu" onclick="document.querySelector('#own-menu').hidden=false">More</button><div role="menu" id="own-menu" hidden><button role="menuitem" onclick="setTimeout(()=>{document.body.insertAdjacentHTML('beforeend',window.dialogHtml);window.finishDialog()},${state.dialogDelay||0})">Connect</button></div>`:`<a aria-label="Invite Target Fixture to connect" href="${state.wrongLink?'/preload/custom-invite/?vanityName=other-fixture':invite}">Connect</a>`}</section><aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other Connect</a><button aria-label="Pending">Pending</button><button aria-label="More">More</button></aside></main>`;}
 before(async()=>{
  api=await import(pathToFileURL(path.join(process.cwd(),'lib/linkedin/connect.ts')).href);
  browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,args:['--no-sandbox','--disable-dev-shm-usage']});
@@ -24,7 +24,15 @@ beforeEach(async()=>{
   if(!route.request().isNavigationRequest())return route.abort();
   if(state.redirect&&url===target)return route.fulfill({status:200,contentType:'text/html',body:'<script>history.replaceState(null,"","/authwall")</script><main><h1>Join LinkedIn</h1></main>'});
   const markup=url.includes('custom-invite')?dialog():profile();
-  return route.fulfill({status:state.blockAfterSend&&state.sends?999:200,contentType:'text/html',body:markup+`<script>window.dialogHtml=${JSON.stringify(dialog())}</script>`});
+  return route.fulfill({status:state.blockAfterSend&&state.sends?999:200,contentType:'text/html',body:markup+`<script>
+window.dialogHtml=${JSON.stringify(dialog())};
+window.finishDialog=()=>{
+ setTimeout(()=>{const p=document.querySelector('#fixture-recipient');if(p)p.textContent=${JSON.stringify(state.wrongDialog?'Other Fixture':'Target Fixture')}},${state.recipientDelay||0});
+ setTimeout(()=>{const b=document.querySelector('[data-fixture-send]');if(b)b.hidden=false},${state.sendDelay||0});
+};window.finishDialog();
+${state.headingDelay?`const main=document.querySelector('main');if(main){main.hidden=true;setTimeout(()=>main.hidden=false,${state.headingDelay})}`:''}
+${state.pending&&state.pendingDelay?`setTimeout(()=>{const section=document.querySelector('main section');if(section)section.insertAdjacentHTML('beforeend','<button aria-label="Pending">Pending</button>')},${state.pendingDelay})`:''}
+</script>`});
  });
 });
 afterEach(async()=>{if(context)await context.close()});
@@ -89,4 +97,20 @@ test('already connected target never receives another invitation',async()=>{
 });
 test('weekly-limit rejection stops before final Send',async()=>{
  state.weeklyLimit=true;await assert.rejects(api.sendConnectionRequest(page,target),api.WeeklyLimitError);assert.equal(state.sends,0);
+});
+test('delayed target-controlled More dialog waits and sends exactly once',async()=>{
+ state.more=true;state.dialogDelay=150;let fences=0;
+ await api.sendConnectionRequest(page,target,()=>{fences++});
+ assert.equal(fences,1);assert.equal(state.sends,1);
+ assert.equal(state.visits.filter(u=>u===target).length,2);
+});
+test('delayed recipient and final no-note control wait before the only Send',async()=>{
+ state.recipientDelay=150;state.sendDelay=300;
+ await api.sendConnectionRequest(page,target);
+ assert.equal(state.sends,1);assert.equal(state.pending,true);
+});
+test('delayed profile heading and post-send Pending render without repeat navigation or action',async()=>{
+ state.headingDelay=150;state.pendingDelay=300;
+ await api.sendConnectionRequest(page,target);
+ assert.equal(state.sends,1);assert.equal(state.visits.filter(u=>u===target).length,2);
 });
