@@ -2,7 +2,7 @@ import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
 import { visitProfile } from "@/lib/linkedin/visit";
-import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
+import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError, InvitationOutcomeUnknownError, hasUnresolvedInvitationOutcome, recordUnknownInvitationOutcome, clearConfirmedInvitationOutcome } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { sendEmail } from "@/lib/email/sender";
@@ -470,6 +470,7 @@ async function executeStep(
   emailAccountLimits?: EmailAccountLimits | null,
   campaignPrompt?: string | null
 ): Promise<void> {
+  let invitationTargetUrl: string | null = null;
   const stepIndex = tr.current_step;
   if (stepIndex >= steps.length) {
     db.prepare("UPDATE run_profile_tracks SET state = 'completed', last_step_at = datetime('now') WHERE id = ?").run(tr.id);
@@ -540,13 +541,28 @@ async function executeStep(
         return;
       }
 
+      // Keep uncertainty independent of run history/manual retry. No automatic reset.
+      if (hasUnresolvedInvitationOutcome(db, target.id, target.linkedin_url)) {
+        trFail(db, tr, "Invitation outcome unknown: owner reconciliation required before any retry.");
+        db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
+        return;
+      }
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending connection request to ${name}`);
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
+      invitationTargetUrl = linkedinUrl;
+      if (hasUnresolvedInvitationOutcome(db, target.id, linkedinUrl)) {
+        trFail(db, tr, "Invitation outcome unknown: owner reconciliation required before any retry.");
+        db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
+        return;
+      }
       const page = await getSessionPage(accountId);
-      try { await sendConnectionRequest(page, linkedinUrl); } finally { await page.close(); }
+      try {
+        await sendConnectionRequest(page, linkedinUrl, () => recordUnknownInvitationOutcome(db, target.id, linkedinUrl));
+      } finally { await page.close(); }
       await saveSessionState(accountId);
       db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
+      clearConfirmedInvitationOutcome(db, target.id, linkedinUrl);
       trWait(db, tr, CONNECTION_RECHECK_HOURS);
       log(db, runId, target.id, "info", `Connection request sent to ${name} — will recheck in ${CONNECTION_RECHECK_HOURS}h`);
 
@@ -903,6 +919,13 @@ async function executeStep(
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (err instanceof InvitationOutcomeUnknownError) {
+      recordUnknownInvitationOutcome(db, target.id, invitationTargetUrl);
+      log(db, runId, target.id, "error", err.message);
+      trFail(db, tr, err.message);
+      db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
+      return;
+    }
     if (err instanceof WeeklyLimitError) {
       log(db, runId, target.id, "error", `Weekly connection limit reached — pausing run`);
       db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
@@ -911,12 +934,14 @@ async function executeStep(
     if (err instanceof AlreadyConnectedError) {
       log(db, runId, target.id, "info", `${name} already connected — advancing`);
       db.prepare("UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?").run(nowIso(), target.id);
+      clearConfirmedInvitationOutcome(db, target.id, invitationTargetUrl);
       trAdvance(db, tr, steps);
       return;
     }
     if (err instanceof PendingInviteError) {
       log(db, runId, target.id, "info", `${name} invite already pending — will recheck`);
       if (!target.connection_requested_at) db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
+      clearConfirmedInvitationOutcome(db, target.id, invitationTargetUrl);
       trWait(db, tr, CONNECTION_RECHECK_HOURS);
       return;
     }
