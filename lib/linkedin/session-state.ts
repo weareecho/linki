@@ -9,6 +9,32 @@ export class LinkedInSessionUnavailableError extends Error {
   }
 }
 
+// Older supported import records omitted expiry. Treat only that omission as a
+// session cookie; explicit invalid/expired values must still fail validation.
+// Normalize in memory, leaving the encrypted record and its Auth flag untouched.
+export function normalizeLegacyLinkedInState(state: unknown): unknown {
+  if (!state || typeof state !== "object") return state;
+  const value = state as { cookies?: unknown; origins?: unknown };
+  if (!Array.isArray(value.cookies) || !Array.isArray(value.origins)) return state;
+  return { ...value, cookies: value.cookies.map(cookie => {
+    if (!cookie || typeof cookie !== "object" || cookie.expires !== undefined ||
+      typeof cookie.name !== "string" || typeof cookie.value !== "string" ||
+      ![".linkedin.com", "linkedin.com", "www.linkedin.com"].includes(cookie.domain) || cookie.path !== "/") return cookie;
+    return { httpOnly: false, secure: true, sameSite: "Lax", ...cookie, expires: -1 };
+  }) };
+}
+
+export function createImportedLinkedInState(liAt: string, documentCookie = ""): LinkedInStorageState {
+  const extras = documentCookie.split(";").flatMap(part => {
+    const eq = part.indexOf("=");
+    if (eq < 0) return [];
+    const name = part.slice(0, eq).trim(), value = part.slice(eq + 1).trim();
+    return name && value && name !== "li_at"
+      ? [{ name, value, domain: ".linkedin.com", path: "/", expires: -1, httpOnly: false, secure: true, sameSite: "Lax" as const }] : [];
+  });
+  return { cookies: [{ name: "li_at", value: liAt.trim(), domain: ".linkedin.com", path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "None" }, ...extras], origins: [] };
+}
+
 // This proves usable saved credentials, not live access or the account's identity.
 export function hasUsableLinkedInState(state: unknown, nowSeconds = Date.now() / 1000): state is LinkedInStorageState {
   if (!state || typeof state !== "object") return false;

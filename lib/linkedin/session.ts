@@ -3,7 +3,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
-import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, LinkedInSessionUnavailableError, loginLocation } from "@/lib/linkedin/session-state";
+import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
 
 chromium.use(StealthPlugin());
 
@@ -65,10 +65,10 @@ async function getOrCreateContext(accountId: string): Promise<BrowserContext> {
   if (!account) throw new Error(`Account ${accountId} not found`);
 
   if (!contexts.has(accountId)) {
-    let storageState: object | undefined;
+    let storageState: unknown;
     if (account.cookies_json) {
       try {
-        storageState = JSON.parse(decryptSecret(account.cookies_json)!);
+        storageState = normalizeLegacyLinkedInState(JSON.parse(decryptSecret(account.cookies_json)!));
       } catch {
         // Fail closed: never navigate with an empty context after decryption failure.
         throw new LinkedInSessionUnavailableError();
@@ -328,8 +328,10 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
     const url = page.url();
     if (/\/feed\//.test(url) || /linkedin\.com\/sales\//.test(url)) {
       if (await hasSignedInLinkedInEvidence(page)) return { status: "authenticated" };
-      return { status: "error", message: "LinkedIn did not provide a usable signed-in session. Resolve verification through LinkedIn, then use Server login." };
+      // DOMContentLoaded can precede signed-in navigation hydration. Observe
+      // within this deadline without resubmitting login or navigating elsewhere.
     }
+    if (loginLocation(url) === "/authwall") return { status: "error", message: "LinkedIn access requires verification. Stop and use LinkedIn's normal owner flow." };
 
     // Email/SMS PIN entry
     const pin = page.locator(PIN_SELECTOR).first();
