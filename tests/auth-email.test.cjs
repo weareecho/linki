@@ -24,6 +24,8 @@ let db, signup, authorize;
 beforeEach(async () => {
   if (db) db.close();
   db = globalThis.authTestDb = new DatabaseSync(':memory:');
+  const { registerLoginEmailNormalizer } = await import(pathToFileURL(path.join(root, 'lib/auth-email.ts')).href);
+  registerLoginEmailNormalizer(db);
   db.exec('CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)');
   globalThis.authTestLimited = false;
   process.env.AUTH_PASSWORD = 'fixture-invite';
@@ -48,6 +50,31 @@ test('legacy mixed-case padded email retains its identity', async () => {
   insert(' Kayvon@Example.test ');
   assert.deepEqual(await authorize({email:'kayvon@example.test',password},{}), {id:'fixture-user',email:' Kayvon@Example.test '});
 });
+for (const [label, storedEmail, canonical] of [
+  ['tabs/newlines', '\tKayvon@Example.test\n', 'kayvon@example.test'],
+  ['nonbreaking spaces', '\u00a0Kayvon@Example.test\u00a0', 'kayvon@example.test'],
+  ['Unicode case', 'Élodie@Example.test', 'élodie@example.test'],
+]) {
+  test(`legacy ${label}: exact and canonical login preserve the record and duplicate signup rejects`, async () => {
+    insert(storedEmail);
+    const before = db.prepare('SELECT * FROM users').get();
+    for (const email of [storedEmail, canonical]) {
+      assert.deepEqual(await authorize({email,password},{}), {id:'fixture-user',email:storedEmail});
+    }
+    assert.equal((await register({email:canonical,password,inviteCode:'fixture-invite'})).code,409);
+    assert.deepEqual(db.prepare('SELECT * FROM users').get(), before);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM users').get().n,1);
+  });
+  test(`legacy ${label}: canonical collisions refuse both exact aliases`, async () => {
+    insert(storedEmail,'one'); insert(canonical,'two');
+    const before=db.prepare('SELECT * FROM users ORDER BY id').all();
+    for (const email of [storedEmail, canonical]) {
+      assert.equal(await authorize({email,password},{}),null);
+    }
+    assert.equal((await register({email:canonical,password,inviteCode:'fixture-invite'})).code,409);
+    assert.deepEqual(db.prepare('SELECT * FROM users ORDER BY id').all(), before);
+  });
+}
 test('signup rejects a canonical duplicate of a legacy account', async () => {
   insert(' Kayvon@Example.test ');
   assert.equal((await register({email:'KAYVON@example.test',password,inviteCode:'fixture-invite'})).code,409);
