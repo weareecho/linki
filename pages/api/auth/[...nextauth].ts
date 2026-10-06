@@ -1,8 +1,9 @@
-import NextAuth, { NextAuthOptions } from "next-auth";
+import NextAuth, { type NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
 import { getDb } from "@/lib/db";
 import { isRateLimited } from "@/lib/rate-limit";
+import { LOGIN_EMAIL_LOOKUP_SQL, normalizeLoginEmail } from "@/lib/auth-email";
 
 type UserRow = { id: string; email: string; password_hash: string };
 
@@ -15,7 +16,8 @@ export const authOptions: NextAuthOptions = {
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials, req) {
-        if (!credentials?.email || !credentials?.password) return null;
+        const normalizedEmail = normalizeLoginEmail(credentials?.email);
+        if (!normalizedEmail || typeof credentials?.password !== "string" || !credentials.password) return null;
 
         // Throttle login attempts per IP — this is the password brute-force surface.
         if (isRateLimited(req, "login", 10, 15 * 60 * 1000)) {
@@ -23,11 +25,10 @@ export const authOptions: NextAuthOptions = {
         }
 
         const db = getDb();
-        const user = db
-          .prepare("SELECT id, email, password_hash FROM users WHERE email = ?")
-          .get(credentials.email) as UserRow | undefined;
-
-        if (!user) return null;
+        const users = db.prepare(LOGIN_EMAIL_LOOKUP_SQL).all(normalizedEmail) as UserRow[];
+        // Never choose between ambiguous pre-existing aliases.
+        if (users.length !== 1) return null;
+        const user = users[0];
 
         const valid = await bcrypt.compare(credentials.password, user.password_hash);
         if (!valid) return null;

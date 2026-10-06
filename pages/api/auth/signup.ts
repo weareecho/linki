@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import { isRateLimited } from "@/lib/rate-limit";
+import { LOGIN_EMAIL_LOOKUP_SQL, normalizeLoginEmail } from "@/lib/auth-email";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") return res.status(405).end();
@@ -18,7 +19,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     inviteCode?: string;
   };
 
-  if (!email || !password || !inviteCode) {
+  const normalizedEmail = normalizeLoginEmail(email);
+  if (!normalizedEmail || typeof password !== "string" || !password || typeof inviteCode !== "string" || !inviteCode) {
     return res.status(400).json({ error: "Email, password, and invite code are required." });
   }
 
@@ -36,13 +38,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   const db = getDb();
-  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+  const existing = db.prepare(LOGIN_EMAIL_LOOKUP_SQL).get(normalizedEmail);
   if (existing) {
     return res.status(409).json({ error: "An account with this email already exists." });
   }
 
   const hash = await bcrypt.hash(password, 10);
-  db.prepare("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)").run(randomUUID(), email, hash);
+  db.prepare("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)").run(randomUUID(), normalizedEmail, hash);
 
   return res.status(201).json({ ok: true });
 }
