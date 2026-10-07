@@ -92,7 +92,7 @@ async function assertNoProviderRejection(page: Page): Promise<void> {
  * positive Pending state for that target. Never retries clicks or uncertain sends.
  * The caller must independently verify its authenticated account before invoking.
  */
-export async function sendConnectionRequest(page: Page, linkedinUrl: string, beforeSend?: () => void | Promise<void>): Promise<void> {
+export async function sendConnectionRequest(page: Page, linkedinUrl: string, beforeSend?: () => void | Promise<void>, approved?: { note: string; fullName: string }): Promise<void> {
   const slug = profileSlug(linkedinUrl);
   if (!slug) throw new TargetProfileMismatchError("An exact HTTPS LinkedIn profile URL is required.");
   let sendAttempted = false;
@@ -106,6 +106,8 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     const card = await exactProfileCard(page, slug);
     const name = (await card.locator("h1").innerText()).trim();
     if (!name) throw new TargetProfileMismatchError("Target name is absent; stop.");
+    if (approved && (name.toLocaleLowerCase() !== approved.fullName.trim().toLocaleLowerCase()
+        || !approved.note.trim() || approved.note.length > 200)) throw new TargetProfileMismatchError("Approved recipient or note is not verified; stop.");
     if (/\b1st\b/.test(await card.innerText()) || await card.getByText("1st", { exact: true }).count() > 0) {
       throw new AlreadyConnectedError("Already connected");
     }
@@ -121,6 +123,9 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
         throw new LinkedInAccessBlockedError("Target invitation page unavailable; stop.");
       }
     } else {
+      // Button/menu layouts may invite immediately without a note. Echo's
+      // note-scoped approval cannot authorize that side effect.
+      if (approved) throw new TargetProfileMismatchError("Note-scoped invitation requires an exact target invitation link; stop.");
       const connect = card.getByRole("button", { name: /^(Connect|Invite .+ to connect)$/ });
       if (await connect.count() === 1) {
         const label = await connect.getAttribute("aria-label");
@@ -165,7 +170,18 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     })) {
       throw new TargetProfileMismatchError("Invitation dialog recipient is not verified; stop.");
     }
-    const send = dialog.getByRole("button", { name: /^(Send without a note|Send now)$/ });
+    if (approved) {
+      const add = dialog.getByRole("button", { name: "Add a note", exact: true });
+      if (await add.count() !== 1) throw new TargetProfileMismatchError("Unique Add a note control absent; stop.");
+      await add.click();
+      const textbox = dialog.getByRole("textbox");
+      if (!await observeRendering(page, async () => await textbox.count() === 1 && await textbox.isVisible())) {
+        throw new TargetProfileMismatchError("Unique note editor absent; stop.");
+      }
+      await textbox.fill(approved.note);
+      if (await textbox.inputValue() !== approved.note) throw new TargetProfileMismatchError("Invitation note changed; stop.");
+    }
+    const send = dialog.getByRole("button", { name: approved ? /^Send$/ : /^(Send without a note|Send now)$/ });
     if (!await observeRendering(page, async () => {
       if (await dialogs.count() !== 1 || await send.count() > 1 || await recipient.count() !== 1) throw new TargetProfileMismatchError("Invitation recipient or controls changed; stop.");
       return await send.count() === 1 && await send.isVisible() && await send.isEnabled();
@@ -175,6 +191,11 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
       throw new TargetProfileMismatchError("Invitation recipient or controls changed before Send; stop.");
     }
     await fence();
+    if (await dialogs.count() !== 1 || await recipient.count() !== 1 || !await recipient.isVisible()
+        || await send.count() !== 1 || !await send.isVisible() || !await send.isEnabled()) {
+      throw new TargetProfileMismatchError("Invitation recipient or controls changed during eligibility check; stop.");
+    }
+    if (approved && await dialog.getByRole("textbox").inputValue() !== approved.note) throw new TargetProfileMismatchError("Invitation note changed before Send; stop.");
     sendAttempted = true; // Set before click: even a timeout may have sent it.
     await send.click();
     const closed = await dialog.waitFor({ state: "hidden", timeout: 10000 }).then(() => true).catch(() => false);

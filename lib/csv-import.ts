@@ -157,6 +157,12 @@ export function importCsv(db: DB, listId: string, csvText: string): CsvImportRes
       }
 
       const linkResult = linkToList.run(listId, targetId);
+      if (row.fields.notes?.startsWith("Echo reservation ")) {
+        // Preserve managed origin even if an editable notes field is cleared.
+        // Never overwrite the first approved scope on a later CSV update.
+        db.prepare("INSERT INTO app_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING")
+          .run(`echo-scope:${targetId}`, row.fields.notes);
+      }
       if (linkResult.changes > 0) {
         if (isNew) imported++; else updated++;
       } else {
