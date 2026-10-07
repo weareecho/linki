@@ -11,6 +11,7 @@ import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
 import { premium } from "@/lib/premium";
 import { decryptSecret } from "@/lib/crypto";
+import { assertEchoEligible, parseEchoScope, EchoEligibilityError, type EchoScope } from "@/lib/linkedin/echo-guard";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
 const SALES_NAV_ENRICH_MIN_GAP_MS = 5 * 60 * 1000;
@@ -183,6 +184,7 @@ interface Target {
   email_replied_at: string | null;
   company_id: string | null;
   messaging_urn: string | null;
+  notes?: string | null;
 }
 
 interface Template { id: string; body: string; }
@@ -490,8 +492,27 @@ async function executeStep(
 
   const step = steps[stepIndex];
   const name = target.full_name ?? target.linkedin_url;
+  let echoScope: EchoScope | null = null;
 
   try {
+    const workflow = db.prepare("SELECT name FROM workflows WHERE id = ?").get(tr.workflow_id) as { name: string } | undefined;
+    const storedEcho = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(`echo-scope:${target.id}`) as { value: string } | undefined;
+    const managed = Boolean(storedEcho || target.notes?.startsWith("Echo reservation ") || /^Echo\b/i.test(workflow?.name || ""));
+    if (managed) {
+      const fresh = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
+      const run = db.prepare("SELECT list_id FROM runs WHERE id = ?").get(runId) as { list_id: string };
+      const notes = storedEcho?.value || fresh.notes;
+      db.prepare("INSERT INTO app_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING")
+        .run(`echo-scope:${target.id}`, notes || "managed-without-approval");
+      // Echo's approved scope permits an initial connection only. Block all
+      // message/InMail/email/enrichment paths before any paid/provider call.
+      if (!["delay", "visit", "connect"].includes(step.step_type)) throw new EchoEligibilityError();
+      echoScope = parseEchoScope(notes, {
+        list_id: run?.list_id, account_id: accountId, profile: fresh.linkedin_url,
+        full_name: fresh.full_name || "", company: fresh.company || "",
+      });
+      await assertEchoEligible(echoScope, "check");
+    }
     if (step.step_type === "delay") {
       trAdvance(db, tr, steps);
       log(db, runId, target.id, "info", `Delay step passed for ${name}`);
@@ -558,10 +579,20 @@ async function executeStep(
       }
       const page = await getSessionPage(accountId);
       try {
-        await sendConnectionRequest(page, linkedinUrl, () => recordUnknownInvitationOutcome(db, target.id, linkedinUrl));
+        await sendConnectionRequest(page, linkedinUrl, async () => {
+          if (echoScope) await assertEchoEligible({ ...echoScope, profile: linkedinUrl }, "claim");
+          recordUnknownInvitationOutcome(db, target.id, linkedinUrl);
+        }, echoScope ? { note: echoScope.note, fullName: echoScope.full_name } : undefined);
       } finally { await page.close(); }
       await saveSessionState(accountId);
       db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
+      if (echoScope) {
+        await assertEchoEligible(echoScope, "complete");
+        clearConfirmedInvitationOutcome(db, target.id, linkedinUrl);
+        db.prepare("UPDATE run_profile_tracks SET state = 'completed', last_step_at = datetime('now') WHERE id = ?").run(tr.id);
+        log(db, runId, target.id, "info", "Echo initial connection confirmed; no followup authorized");
+        return;
+      }
       clearConfirmedInvitationOutcome(db, target.id, linkedinUrl);
       trWait(db, tr, CONNECTION_RECHECK_HOURS);
       log(db, runId, target.id, "info", `Connection request sent to ${name} — will recheck in ${CONNECTION_RECHECK_HOURS}h`);
@@ -919,6 +950,11 @@ async function executeStep(
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (err instanceof EchoEligibilityError) {
+      trFail(db, tr, err.message);
+      db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
+      return;
+    }
     if (err instanceof InvitationOutcomeUnknownError) {
       recordUnknownInvitationOutcome(db, target.id, invitationTargetUrl);
       log(db, runId, target.id, "error", err.message);

@@ -1,0 +1,13 @@
+# Echo initial connection scope
+
+Companion to the owner-started eligibility bridge in `weareecho/Echo-email-automation`. No bridge URL, secret, workflow, account or prospect action is configured by this branch.
+
+Echo CSV imports persist the original approval notes in `app_settings` keyed by target, so clearing editable notes does not remove managed origin. Echo-named workflows with missing scope also fail closed. Managed targets may only pass delay/visit/initial connect steps; message, InMail and email are held before enrichment or provider access.
+
+The runner binds the exact approved fingerprint, existing run list, actual account, stored profile, full name, company and rendered note to a fresh authenticated local Echo check. Immediately before Send, it requests a durable action claim, then persists the existing local unknown-outcome fence. Failed, revoked, cancelled, unavailable or uncertain checks stop execution and pause the run. The approved note is filled and read back, exact recipient and controls are rechecked after the awaited claim, and Send is clicked once. Immediate no-note Connect/More fallbacks cannot satisfy note-scoped approval and are refused. Only positive Pending on the exact profile permits completion; no followup step is enabled.
+
+`ECHO_GUARD_URL` is an optional new runtime setting, unset until deployment/listener approval. It must be local HTTP (`127.0.0.1`, `localhost` or Docker Desktop `host.docker.internal`) with exact `/echo/action` path, no URL credentials/query/fragment. Existing `INTERNAL_API_SECRET` is reused and never sent to public endpoints or redirects. One request per phase, five-second timeout, no retries. The companion host bridge binds loopback only; verify host reachability with synthetic data before activating prospects, without firewall/public-bind workarounds.
+
+Owner must approve exact copy/audience/note/account manifest and reviewed deployment/listener config, complete supported secure LinkedIn login, and verify existing caps/schedule before any workflow activation. An imported target or saved account Auth flag is not proof of authorization or a valid session. Historical imports whose managed origin cannot be established require owner reconciliation; do not activate them speculatively.
+
+Validation: 71 actual-code Node tests pass, including 24 real Chromium DOM cases and real in-memory SQLite runner/CSV cases; TypeScript noEmit passes. Tests run in a disposable copy of the existing release image, network disabled, without production data mounts. Existing authentication/session/invitation tests remain passing. The Echo companion uses disposable PostgreSQL and synthetic local HTTP. No live provider action is performed.
