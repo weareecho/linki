@@ -4,11 +4,12 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
 import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
+import { existingContexts } from "@/lib/linkedin/readiness-session";
 
 chromium.use(StealthPlugin());
 
 let browser: Browser | null = null;
-const contexts: Map<string, BrowserContext> = new Map();
+const contexts: Map<string, BrowserContext> = existingContexts;
 
 const HEADLESS = process.env.HEADLESS !== "false";
 const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
