@@ -11,7 +11,8 @@ import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
 import { premium } from "@/lib/premium";
 import { decryptSecret } from "@/lib/crypto";
-import { assertEchoEligible, parseEchoScope, EchoEligibilityError, type EchoScope } from "@/lib/linkedin/echo-guard";
+import { assertEchoEligible, parseEchoScope, EchoEligibilityError, ECHO_GUARD_ARTIFACT_REVISION, type EchoScope } from "@/lib/linkedin/echo-guard";
+import { recordExecutorStarted, recordExecutorStopped } from "@/lib/linkedin/readiness-artifact";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
 const SALES_NAV_ENRICH_MIN_GAP_MS = 5 * 60 * 1000;
@@ -1000,7 +1001,8 @@ const g = global as typeof global & { __linkiGlobalRunnerStarted?: boolean };
 export function ensureGlobalRunnerStarted(): void {
   if (g.__linkiGlobalRunnerStarted) return;
   g.__linkiGlobalRunnerStarted = true;
-  globalLoop().catch(err => console.error("[runner] Global loop crashed:", err));
+  recordExecutorStarted(ECHO_GUARD_ARTIFACT_REVISION);
+  globalLoop().catch(err => { recordExecutorStopped(); console.error("[runner] Global loop crashed:", err); });
 }
 
 async function globalLoop(): Promise<void> {

@@ -14,7 +14,7 @@ function load(file,stubs={},extra='') {
  vm.runInNewContext(js,{module,exports:module.exports,require:id=>id in stubs?stubs[id]:require(id),process,URL,AbortSignal,fetch:(...args)=>global.fetch(...args),global,console,Date,setTimeout,clearTimeout},{filename:file});
  return module.exports;
 }
-const guard=load('lib/linkedin/echo-guard.ts');
+const guard=load('lib/linkedin/echo-guard.ts',{'./readiness-artifact':{BUILT_GUARD_REVISION:''}});
 const connect=load('lib/linkedin/connect.ts');
 const csv=load('lib/csv-import.ts');
 const fingerprint='a'.repeat(64),note='Hi Ada, I’m Kayvon, co-founder of Echo. Would love to connect.';
@@ -46,6 +46,7 @@ beforeEach(()=>{
  runner=load('lib/linkedin/runner.ts',{
   '@/lib/db':{getDb:()=>db},
   '@/lib/linkedin/echo-guard':guard,
+  '@/lib/linkedin/readiness-artifact':{recordExecutorStarted:()=>{},recordExecutorStopped:()=>{}},
   '@/lib/linkedin/connect':{...connect,sendConnectionRequest:async(page,url,before,approved)=>{assert.deepEqual(JSON.parse(JSON.stringify(approved)),{note,fullName:data.full_name});await before();actions++;}},
   '@/lib/linkedin/session':{getSessionPage:async()=>{pages++;return {close:async()=>{}}},saveSessionState:async()=>{},getSessionContext:boundary},
   '@/lib/linkedin/visit':{visitProfile:boundary},'@/lib/linkedin/message':{sendMessage:boundary},

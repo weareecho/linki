@@ -1,4 +1,7 @@
 // Echo only: reuse the existing internal secret, never send it to a public URL.
+import { BUILT_GUARD_REVISION } from "./readiness-artifact";
+export const ECHO_GUARD_ARTIFACT_REVISION = BUILT_GUARD_REVISION;
+
 export class EchoEligibilityError extends Error {
   constructor() { super("Echo eligibility unavailable, revoked or uncertain; hold for owner review."); }
 }
