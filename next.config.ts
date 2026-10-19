@@ -45,7 +45,7 @@ export default function configuration(phase: string): NextConfig {
   // a caller/runtime environment revision or Git HEAD as running-code evidence.
   const files = ["lib/linkedin/runner.ts", "lib/linkedin/echo-guard.ts",
     "lib/linkedin/connect.ts", "lib/linkedin/visit.ts", "lib/linkedin/message.ts", "lib/linkedin/session.ts",
-    "lib/linkedin/session-state.ts",
+    "lib/linkedin/session-state.ts", "lib/linkedin/schedule.ts",
     "lib/linkedin/readiness-artifact.ts", "lib/linkedin/readiness-session.ts",
     "lib/linkedin/readiness.ts", "lib/linkedin/readiness-store.ts", "pages/api/echo/readiness.ts", "next.config.ts"];
   const digest = createHash("sha256");

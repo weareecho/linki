@@ -20,10 +20,16 @@ export async function sendMessage(page: Page, fullName: string, text: string, li
   const input = page.locator("div.msg-form__contenteditable:visible");
   await input.first().waitFor({ state: "visible", timeout: 10000 });
   await assertRecipient(page, fullName, linkedinUrl);
-  if (await input.count() !== 1 || (await input.innerText()).trim()) throw new Error("Composer is ambiguous or contains a draft; no message sent");
+  if (await input.count() !== 1) throw new Error("Composer is ambiguous; no message sent");
+  const draft = (await input.innerText()).trim();
+  if (draft && draft !== text.trim()) throw new Error("Composer contains another draft; no message sent");
   await input.fill(text);
   if ((await input.innerText()).trim() !== text.trim()) throw new Error("Message text was not entered correctly");
   const button = page.locator("button.msg-form__send-button:visible");
+  const readyBy = Date.now() + 8000;
+  while (Date.now() < readyBy && (await button.count() === 0 || (await button.count() === 1 && !await button.isEnabled()))) {
+    await page.waitForTimeout(100);
+  }
   if (await button.count() !== 1 || !await button.isEnabled()) throw new Error("Send button is unavailable or ambiguous");
   await assertRecipient(page, fullName, linkedinUrl);
   const matches = () => page.locator(".msg-s-event-listitem__body:visible").filter({ hasText: text });

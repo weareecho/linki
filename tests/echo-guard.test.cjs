@@ -14,6 +14,7 @@ function load(file,stubs={},extra='') {
  vm.runInNewContext(js,{module,exports:module.exports,require:id=>id in stubs?stubs[id]:require(id),process,URL,AbortSignal,fetch:(...args)=>global.fetch(...args),global,console,Date,setTimeout,clearTimeout},{filename:file});
  return module.exports;
 }
+const schedule=load('lib/linkedin/schedule.ts');
 const guard=load('lib/linkedin/echo-guard.ts',{'./readiness-artifact':{BUILT_GUARD_REVISION:''}});
 const connect=load('lib/linkedin/connect.ts');
 const csv=load('lib/csv-import.ts');
@@ -44,6 +45,7 @@ beforeEach(()=>{
  db.prepare('INSERT INTO run_profile_tracks(id,run_profile_id,state,current_step) VALUES (?,?,?,0)').run('fixture-track','fixture-profile','pending');
  const boundary=async()=>{throw new Error('Unexpected provider/enrichment boundary')};
  runner=load('lib/linkedin/runner.ts',{
+  '@/lib/linkedin/schedule':schedule,
   '@/lib/db':{getDb:()=>db},
   '@/lib/linkedin/echo-guard':guard,
   '@/lib/linkedin/readiness-artifact':{recordExecutorStarted:()=>{},recordExecutorStopped:()=>{}},
