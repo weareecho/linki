@@ -19,7 +19,7 @@ export function normalizeLegacyLinkedInState(state: unknown): unknown {
   return { ...value, cookies: value.cookies.map(cookie => {
     if (!cookie || typeof cookie !== "object" || cookie.expires !== undefined ||
       typeof cookie.name !== "string" || typeof cookie.value !== "string" ||
-      ![".linkedin.com", "linkedin.com", "www.linkedin.com"].includes(cookie.domain) || cookie.path !== "/") return cookie;
+      ![".linkedin.com", "linkedin.com", ".www.linkedin.com", "www.linkedin.com"].includes(cookie.domain) || cookie.path !== "/") return cookie;
     return { httpOnly: false, secure: true, sameSite: "Lax", ...cookie, expires: -1 };
   }) };
 }
@@ -42,7 +42,7 @@ export function hasUsableLinkedInState(state: unknown, nowSeconds = Date.now() /
   if (!Array.isArray(value.cookies) || !Array.isArray(value.origins)) return false;
   return value.cookies.some(cookie => cookie && typeof cookie === "object" &&
     cookie.name === "li_at" && typeof cookie.value === "string" && cookie.value.trim().length > 0 &&
-    [".linkedin.com", "linkedin.com", "www.linkedin.com"].includes(cookie.domain) &&
+    [".linkedin.com", "linkedin.com", ".www.linkedin.com", "www.linkedin.com"].includes(cookie.domain) &&
     typeof cookie.expires === "number" && Number.isFinite(cookie.expires) &&
     (cookie.expires === -1 || cookie.expires > nowSeconds));
 }

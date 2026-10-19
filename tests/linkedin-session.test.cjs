@@ -137,3 +137,16 @@ test('rechecking a retained session never persists an authwall or missing cookie
   assert.equal((await api.awaitLoginApproval('fixture')).status,'error');assert.equal(f.writes.length,0);
  }
 });
+
+test('LinkedIn documented www domain cookie is accepted without admitting foreign domains',async()=>{
+ for(const domain of ['.www.linkedin.com','www.linkedin.com','.linkedin.com','linkedin.com']){
+  f.state={cookies:[{...valid().cookies[0],domain}],origins:[]};
+  assert.equal(guard.hasUsableLinkedInState(f.state),true);
+  assert.equal((await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password')).status,'authenticated');
+ }
+ for(const domain of ['.www.linkedin.com.evil.test','evil.www.linkedin.com','..www.linkedin.com','.notlinkedin.com']){
+  assert.equal(guard.hasUsableLinkedInState({cookies:[{...valid().cookies[0],domain}],origins:[]}),false);
+ }
+ const legacy={cookies:[{...valid().cookies[0],domain:'.www.linkedin.com',expires:undefined}],origins:[]};
+ assert.equal(guard.hasUsableLinkedInState(guard.normalizeLegacyLinkedInState(legacy)),true);
+});

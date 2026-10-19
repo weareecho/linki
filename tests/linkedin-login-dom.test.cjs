@@ -13,7 +13,7 @@ after(async () => { await browser?.close(); });
 async function check(url, html, withCookie = true) {
   const context = await browser.newContext();
   try {
-    if (withCookie) await context.addCookies([{ name: 'li_at', value: 'synthetic-only', domain: '.linkedin.com', path: '/', secure: true }]);
+    if (withCookie) await context.addCookies([{ name: 'li_at', value: 'synthetic-only', domain: '.www.linkedin.com', path: '/', secure: true }]);
     await context.route('**/*', route => route.fulfill({ contentType: 'text/html', body: html }));
     const page = await context.newPage();
     await page.goto(url);
