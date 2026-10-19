@@ -51,15 +51,18 @@ export function isLinkedInLoginLanding(url: string): boolean {
   try {
     const value = new URL(url);
     return value.protocol === "https:" && ["www.linkedin.com", "linkedin.com"].includes(value.hostname) &&
-      (value.pathname.startsWith("/feed/") || value.pathname.startsWith("/sales/"));
+      !value.username && !value.password && !value.port &&
+      /^\/(feed|sales)(?:\/|$)/.test(value.pathname);
   } catch { return false; }
 }
 
 export async function hasSignedInLinkedInEvidence(page: Page): Promise<boolean> {
   if (!isLinkedInLoginLanding(page.url())) return false;
   if (!hasUsableLinkedInState(await page.context().storageState())) return false;
+  // Filter visibility before selecting the first match: responsive layouts may
+  // keep a hidden desktop navigation before the visible mobile navigation.
   // A guest marketing page/redirect URL alone is insufficient evidence.
-  return page.locator('nav .global-nav__me-photo, nav a[href^="/in/"], a[data-control-name="identity_profile_photo"][href*="/in/"]').first()
+  return page.locator('nav .global-nav__me-photo:visible, nav a[href^="/in/"]:visible, a[data-control-name="identity_profile_photo"][href*="/in/"]:visible').first()
     .isVisible().catch(() => false);
 }
 

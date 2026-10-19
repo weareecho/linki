@@ -3,7 +3,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
-import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
+import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, isLinkedInLoginLanding, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
 import { existingContexts } from "@/lib/linkedin/readiness-session";
 
 chromium.use(StealthPlugin());
@@ -272,10 +272,10 @@ export async function authenticateAccount(accountId: string): Promise<void> {
 
 export type LoginResult =
   | { status: "authenticated" }
-  | { status: "challenge"; kind: "otp" | "app" | "captcha" | "unknown"; message: string }
+  | { status: "challenge"; kind: "otp" | "app" | "captcha" | "unknown" | "session"; message: string }
   | { status: "error"; message: string };
 
-type PendingLogin = { ctx: BrowserContext; page: Page; createdAt: number };
+type PendingLogin = { ctx: BrowserContext; page: Page; createdAt: number; expiryTimer: ReturnType<typeof setTimeout> };
 const pendingLogins: Map<string, PendingLogin> = new Map();
 const PENDING_TTL_MS = 10 * 60_000;
 
@@ -289,8 +289,17 @@ async function clearPendingLogin(accountId: string): Promise<void> {
   const p = pendingLogins.get(accountId);
   if (p) {
     pendingLogins.delete(accountId);
+    clearTimeout(p.expiryTimer);
     try { await p.ctx.close(); } catch { /* already gone */ }
   }
+}
+
+function retainPendingLogin(accountId: string, ctx: BrowserContext, page: Page): void {
+  const previous = pendingLogins.get(accountId);
+  if (previous) clearTimeout(previous.expiryTimer);
+  const expiryTimer = setTimeout(() => { void clearPendingLogin(accountId); }, PENDING_TTL_MS);
+  expiryTimer.unref();
+  pendingLogins.set(accountId, { ctx, page, createdAt: Date.now(), expiryTimer });
 }
 
 function sweepPendingLogins(): void {
@@ -327,7 +336,7 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
   const deadline = start + 20_000;
   while (Date.now() < deadline) {
     const url = page.url();
-    if (/\/feed\//.test(url) || /linkedin\.com\/sales\//.test(url)) {
+    if (isLinkedInLoginLanding(url)) {
       if (await hasSignedInLinkedInEvidence(page)) return { status: "authenticated" };
       // DOMContentLoaded can precede signed-in navigation hydration. Observe
       // within this deadline without resubmitting login or navigating elsewhere.
@@ -374,6 +383,17 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
     await page.waitForTimeout(800);
   }
 
+  if (isLinkedInLoginLanding(page.url())) {
+    const usableCookie = hasUsableLinkedInState(await page.context().storageState());
+    // Booleans/category only: never log cookies, HTML, account details or URLs.
+    console.warn(`[login-check] location=${loginLocation(page.url())} usable_cookie=${usableCookie} signed_in_navigation=false`);
+    if (usableCookie) return {
+      status: "challenge", kind: "session",
+      message: "LinkedIn reached your feed, but Linki could not verify the signed-in navigation yet. Your login is kept temporarily. Click Continue to check again without entering your password.",
+    };
+    return { status: "error", message: "LinkedIn reached the feed without a usable login cookie. The session was not saved. Please sign in again through Server login." };
+  }
+
   if (/checkpoint/.test(page.url())) {
     return {
       status: "challenge",
@@ -417,7 +437,7 @@ export async function startHeadlessLogin(
       return result;
     }
     if (result.status === "challenge" && result.kind !== "captcha") {
-      pendingLogins.set(accountId, { ctx, page, createdAt: Date.now() });
+      retainPendingLogin(accountId, ctx, page);
       return result;
     }
     await ctx.close();
@@ -430,6 +450,7 @@ export async function startHeadlessLogin(
 }
 
 export async function submitLoginChallenge(accountId: string, code: string): Promise<LoginResult> {
+  sweepPendingLogins();
   const p = pendingLogins.get(accountId);
   if (!p) return { status: "error", message: "No login in progress (it may have timed out — start again)." };
 
@@ -451,7 +472,7 @@ export async function submitLoginChallenge(accountId: string, code: string): Pro
       return result;
     }
     if (result.status === "challenge" && result.kind !== "captcha") {
-      p.createdAt = Date.now(); // keep the session alive for another step
+      retainPendingLogin(accountId, ctx, page); // keep the session alive for another step
       return result;
     }
     await clearPendingLogin(accountId);
@@ -471,14 +492,15 @@ export async function submitLoginChallenge(accountId: string, code: string): Pro
  * interstitial. If still pending, returns the challenge so the user can retry.
  */
 export async function awaitLoginApproval(accountId: string): Promise<LoginResult> {
+  sweepPendingLogins();
   const p = pendingLogins.get(accountId);
   if (!p) return { status: "error", message: "No login in progress (it may have timed out — start again)." };
 
   const { ctx, page } = p;
-  p.createdAt = Date.now();
+  retainPendingLogin(accountId, ctx, page);
   try {
     const reachedFeed = await page
-      .waitForURL(/\/feed\/|linkedin\.com\/sales\//, { timeout: 50_000 })
+      .waitForURL(url => isLinkedInLoginLanding(url.href), { timeout: 50_000 })
       .then(() => true)
       .catch(() => false);
 
@@ -489,7 +511,7 @@ export async function awaitLoginApproval(accountId: string): Promise<LoginResult
         .first();
       if ((await btn.count().catch(() => 0)) > 0) {
         await btn.click().catch(() => {});
-        await page.waitForURL(/\/feed\/|linkedin\.com\/sales\//, { timeout: 20_000 }).catch(() => {});
+        await page.waitForURL(url => isLinkedInLoginLanding(url.href), { timeout: 20_000 }).catch(() => {});
       }
     }
 
@@ -501,7 +523,7 @@ export async function awaitLoginApproval(accountId: string): Promise<LoginResult
       return result;
     }
     if (result.status === "challenge" && result.kind !== "captcha") {
-      p.createdAt = Date.now();
+      retainPendingLogin(accountId, ctx, page);
       return result;
     }
     await clearPendingLogin(accountId);
