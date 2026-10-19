@@ -49,8 +49,8 @@ function inviteMatchesTarget(value: string, slug: string): boolean {
   } catch { return false; }
 }
 
-async function exactProfileCard(page: Page, slug: string): Promise<Locator> {
-  const heading = page.locator("main h1");
+async function exactProfileCard(page: Page, slug: string, fullName?: string): Promise<Locator> {
+  const heading = fullName ? page.locator("main").getByRole("heading", { name: fullName, exact: true }).filter({ visible: true }) : page.locator("main h1:visible");
   const card = heading.locator("xpath=ancestor::section[1]");
   const ready = await observeRendering(page, async () => {
     if (profileSlug(page.url()) !== slug) throw new TargetProfileMismatchError("Exact target profile was not reached; stop.");
@@ -92,7 +92,7 @@ async function assertNoProviderRejection(page: Page): Promise<void> {
  * positive Pending state for that target. Never retries clicks or uncertain sends.
  * The caller must independently verify its authenticated account before invoking.
  */
-export async function sendConnectionRequest(page: Page, linkedinUrl: string, beforeSend?: () => void | Promise<void>, approved?: { note: string; fullName: string }): Promise<void> {
+export async function sendConnectionRequest(page: Page, linkedinUrl: string, beforeSend?: () => void | Promise<void>, approved?: { note: string; fullName: string }, fullName?: string): Promise<void> {
   const slug = profileSlug(linkedinUrl);
   if (!slug) throw new TargetProfileMismatchError("An exact HTTPS LinkedIn profile URL is required.");
   let sendAttempted = false;
@@ -103,8 +103,8 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
   try {
     const response = await page.goto(linkedinUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     if (!response || response.status() >= 400) throw new LinkedInAccessBlockedError("LinkedIn access failed; stop without inviting.");
-    const card = await exactProfileCard(page, slug);
-    const name = (await card.locator("h1").innerText()).trim();
+    const card = await exactProfileCard(page, slug, approved?.fullName || fullName);
+    const name = (await card.locator("h1:visible,h2:visible").innerText()).trim();
     if (!name) throw new TargetProfileMismatchError("Target name is absent; stop.");
     if (approved && (name.toLocaleLowerCase() !== approved.fullName.trim().toLocaleLowerCase()
         || !approved.note.trim() || approved.note.length > 200)) throw new TargetProfileMismatchError("Approved recipient or note is not verified; stop.");
@@ -205,7 +205,7 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     // One normal read-only post-action check. Absence of a toast/dialog is not success.
     const observed = await page.goto(linkedinUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     if (!observed || observed.status() >= 400) throw new InvitationOutcomeUnknownError(true);
-    const observedCard = await exactProfileCard(page, slug);
+    const observedCard = await exactProfileCard(page, slug, approved?.fullName || fullName);
     if (!await observeRendering(page, async () => {
       if (profileSlug(page.url()) !== slug) throw new TargetProfileMismatchError("Post-send profile changed; stop.");
       return await isPending(observedCard);

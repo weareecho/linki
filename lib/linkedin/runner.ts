@@ -583,7 +583,7 @@ async function executeStep(
         await sendConnectionRequest(page, linkedinUrl, async () => {
           if (echoScope) await assertEchoEligible({ ...echoScope, profile: linkedinUrl }, "claim");
           recordUnknownInvitationOutcome(db, target.id, linkedinUrl);
-        }, echoScope ? { note: echoScope.note, fullName: echoScope.full_name } : undefined);
+        }, echoScope ? { note: echoScope.note, fullName: echoScope.full_name } : undefined, target.full_name || undefined);
       } finally { await page.close(); }
       await saveSessionState(accountId);
       db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
