@@ -526,7 +526,7 @@ async function executeStep(
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
       const page = await getSessionPage(accountId);
       let visitResult: { isFirstDegree: boolean; messagingUrn: string | null };
-      try { visitResult = await visitProfile(page, linkedinUrl); } finally { await page.close(); }
+      try { visitResult = await visitProfile(page, linkedinUrl, target.full_name || undefined); } finally { await page.close(); }
       await saveSessionState(accountId);
       if (visitResult.isFirstDegree && target.degree !== 1) {
         db.prepare("UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?").run(nowIso(), target.id);
@@ -599,6 +599,10 @@ async function executeStep(
       log(db, runId, target.id, "info", `Connection request sent to ${name} — will recheck in ${CONNECTION_RECHECK_HOURS}h`);
 
     } else if (step.step_type === "message") {
+      const messageFence = `linkedin-message-outcome-unknown:${target.id}`;
+      if (db.prepare("SELECT value FROM app_settings WHERE key = ?").get(messageFence)) {
+        throw new Error("Previous message outcome unresolved; reconcile the exact conversation before retrying");
+      }
       await ensureSalesNavEnriched(db, target, accountId);
       if (!enforceSchedule(db, tr, runId, target.id, name, accountLimits)) return;
 
@@ -683,7 +687,10 @@ async function executeStep(
       const page = await getSessionPage(accountId);
       try {
         if (!target.full_name) throw new Error(`Target ${target.id} has no full_name — cannot search messaging`);
-        const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn);
+        const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn, () => {
+          db.prepare("INSERT INTO app_settings (key,value) VALUES (?,?)").run(messageFence,
+            JSON.stringify({ profile: messageLinkedinUrl, text: messageText, runId, attemptedAt: nowIso() }));
+        });
         if (result.messagingUrn) {
           db.prepare("UPDATE targets SET messaging_urn = COALESCE(messaging_urn, ?) WHERE id = ?").run(result.messagingUrn, target.id);
         }
@@ -700,10 +707,13 @@ async function executeStep(
         await page.close();
       }
       await saveSessionState(accountId);
-      db.prepare("UPDATE targets SET message_sent_at = ? WHERE id = ?").run(nowIso(), target.id);
-      trRecordContext(db, tr, { linkedinMessage: messageText });
-      trAdvance(db, tr, steps);
-      log(db, runId, target.id, "info", `Message sent to ${name}`);
+      db.transaction(() => {
+        db.prepare("UPDATE targets SET message_sent_at = ? WHERE id = ?").run(nowIso(), target.id);
+        trRecordContext(db, tr, { linkedinMessage: messageText });
+        trAdvance(db, tr, steps);
+        log(db, runId, target.id, "info", `Message sent to ${name}`);
+        db.prepare("DELETE FROM app_settings WHERE key = ?").run(messageFence);
+      })();
 
     } else if (step.step_type === "sales_inmail") {
       // Sales Navigator InMail — reaches NON-connections (no degree gate), needs a
