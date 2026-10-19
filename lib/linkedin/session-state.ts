@@ -62,8 +62,27 @@ export async function hasSignedInLinkedInEvidence(page: Page): Promise<boolean> 
   // Filter visibility before selecting the first match: responsive layouts may
   // keep a hidden desktop navigation before the visible mobile navigation.
   // A guest marketing page/redirect URL alone is insufficient evidence.
-  return page.locator('nav .global-nav__me-photo:visible, nav a[href^="/in/"]:visible, a[data-control-name="identity_profile_photo"][href*="/in/"]:visible').first()
+  const legacyNavigation = await page.locator('nav .global-nav__me-photo:visible, nav a[href^="/in/"]:visible, a[data-control-name="identity_profile_photo"][href*="/in/"]:visible').first()
     .isVisible().catch(() => false);
+  if (legacyNavigation) return true;
+  // New layouts need not use legacy CSS classes or an HTML <nav> element.
+  // Require the complete account navigation, not an arbitrary profile/post link.
+  const hrefs = await page.locator('a[href]:visible').evaluateAll(links =>
+    links.map(link => link.getAttribute('href') || '')).catch(() => []);
+  return hasAccountNavigation(hrefs);
+
+}
+
+export function hasAccountNavigation(hrefs: string[]): boolean {
+  const paths = new Set<string>();
+  for (const href of hrefs) {
+    try {
+      const url = new URL(href, "https://www.linkedin.com");
+      if (url.protocol === "https:" && ["www.linkedin.com", "linkedin.com"].includes(url.hostname) &&
+          !url.username && !url.password && !url.port) paths.add(url.pathname.replace(/\/$/, ""));
+    } catch { /* malformed links provide no evidence */ }
+  }
+  return ["/feed", "/mynetwork", "/jobs", "/messaging", "/notifications"].every(path => paths.has(path));
 }
 
 // Do not log provider URLs: checkpoint paths and query strings can contain secrets.

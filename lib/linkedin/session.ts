@@ -4,6 +4,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
 import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, isLinkedInLoginLanding, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
+import { captureLoginDiagnostic } from "@/lib/linkedin/session-diagnostic";
 import { existingContexts } from "@/lib/linkedin/readiness-session";
 
 chromium.use(StealthPlugin());
@@ -387,10 +388,13 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
     const usableCookie = hasUsableLinkedInState(await page.context().storageState());
     // Booleans/category only: never log cookies, HTML, account details or URLs.
     console.warn(`[login-check] location=${loginLocation(page.url())} usable_cookie=${usableCookie} signed_in_navigation=false`);
-    if (usableCookie) return {
+    if (usableCookie) {
+      await captureLoginDiagnostic(page);
+      return {
       status: "challenge", kind: "session",
       message: "LinkedIn reached your feed, but Linki could not verify the signed-in navigation yet. Your login is kept temporarily. Click Continue to check again without entering your password.",
-    };
+      };
+    }
     return { status: "error", message: "LinkedIn reached the feed without a usable login cookie. The session was not saved. Please sign in again through Server login." };
   }
 

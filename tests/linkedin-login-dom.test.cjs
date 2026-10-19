@@ -35,3 +35,16 @@ test('hidden-only, cookie-less, guest and foreign pages fail closed', async () =
     assert.equal(await check(url, nav), false);
   }
 });
+
+const modernNav = paths => '<header>' + paths.map(href => `<a href="${href}">${href}</a>`).join('') + '</header>';
+const accountPaths = ['/feed/', '/mynetwork/', '/jobs/', '/messaging/', '/notifications/'];
+test('complete modern account navigation works without legacy CSS or nav elements', async () => {
+ assert.equal(await check('https://www.linkedin.com/feed/', modernNav(accountPaths)), true);
+ assert.equal(await check('https://www.linkedin.com/feed/', modernNav(accountPaths.map(p=>'https://www.linkedin.com'+p))), true);
+});
+test('partial, foreign, hidden or cookie-less modern navigation never authenticates', async () => {
+ assert.equal(await check('https://www.linkedin.com/feed/', modernNav(accountPaths.slice(0,4))), false);
+ assert.equal(await check('https://www.linkedin.com/feed/', modernNav(accountPaths.map(p=>'https://evil.test'+p))), false);
+ assert.equal(await check('https://www.linkedin.com/feed/', '<div hidden>'+modernNav(accountPaths)+'</div>'), false);
+ assert.equal(await check('https://www.linkedin.com/feed/', modernNav(accountPaths), false), false);
+});
