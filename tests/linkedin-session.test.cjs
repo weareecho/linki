@@ -23,7 +23,8 @@ beforeEach(async()=>{
  f=globalThis.sessionFixture={state:valid(),stored:JSON.stringify(valid()),visibleNav:true,url:'https://www.linkedin.com/feed/',writes:[],navigations:[],contexts:0,elapsed:0,navChecks:0};
  Date.now=()=>realNow()+f.elapsed;
  const locator={first(){return this},async count(){return 0},async evaluateAll(){return []},async waitFor(){},async fill(){},async press(){},async isVisible(){f.navChecks++;return f.navAfter===undefined?f.visibleNav:f.navChecks>=f.navAfter}};
- f.page={url:()=>f.url,context:()=>f.ctx,locator:()=>locator,getByText:()=>({async count(){return 0}}),async goto(url){f.navigations.push(url)},async waitForLoadState(){},async waitForURL(predicate){if(!predicate(new URL(f.url)))throw Error("fixture wait timeout")},async waitForTimeout(ms){f.elapsed+=ms;if(f.afterWait)f.afterWait()},async close(){}};
+ f.page={url:()=>f.url,context:()=>f.ctx,locator:()=>locator,getByText:()=>({async count(){return 0},filter(){return this},first(){return this},async isVisible(){return false}}),async goto(url){f.navigations.push(url)},async waitForLoadState(){},async waitForURL(predicate){if(!predicate(new URL(f.url)))throw Error("fixture wait timeout")},async waitForTimeout(ms){f.elapsed+=ms;if(f.afterWait)f.afterWait()},async close(){}};
+ f.page.frames=()=>[f.page];f.page.mainFrame=()=>f.page;
  f.ctx={storageState:async()=>f.state,newPage:async()=>f.page,on(){},async close(){}};
  f.browser={isConnected:()=>true,async newContext(){globalThis.sessionFixture.contexts++;return globalThis.sessionFixture.ctx},async close(){}};
  f.db={prepare(){return {get:()=>({email:'owner@example.test',cookies_json:f.stored}),run:(...values)=>f.writes.push(values)}}};

@@ -48,3 +48,28 @@ test('partial, foreign, hidden or cookie-less modern navigation never authentica
  assert.equal(await check('https://www.linkedin.com/feed/', '<div hidden>'+modernNav(accountPaths)+'</div>'), false);
  assert.equal(await check('https://www.linkedin.com/feed/', modernNav(accountPaths), false), false);
 });
+
+const accountLabels = ['Home', 'My Network', 'Jobs', 'Messaging', 'Notifications', 'Me', 'Start a post'];
+const observedFeed = labels => labels.map(label => `<button><span>${label}</span></button>`).join('');
+test('observed feed labels and personal composer recognize button-based navigation', async () => {
+ assert.equal(await check('https://www.linkedin.com/feed', observedFeed(accountLabels)), true);
+ assert.equal(await check('https://www.linkedin.com/feed', '<div hidden>'+observedFeed(accountLabels)+'</div>'+observedFeed(accountLabels)), true);
+});
+test('semantic evidence requires every label, visible composer and usable cookie', async () => {
+ for (let i=0;i<accountLabels.length;i++) {
+   assert.equal(await check('https://www.linkedin.com/feed', observedFeed(accountLabels.filter((_,index)=>index!==i))), false);
+ }
+ assert.equal(await check('https://www.linkedin.com/feed', observedFeed(accountLabels), false), false);
+ assert.equal(await check('https://www.linkedin.com/feed', '<div hidden>'+observedFeed(accountLabels)+'</div>'), false);
+});
+test('visible same-origin application frames work; hidden and foreign frames cannot authenticate', async () => {
+ for (const [src,hidden,expected] of [['https://www.linkedin.com/application',false,true], ['https://www.linkedin.com/application',true,false], ['https://foreign.test/application',false,false]]) {
+  const context = await browser.newContext();
+  try {
+   await context.addCookies([{name:'li_at',value:'synthetic-only',domain:'.www.linkedin.com',path:'/',secure:true}]);
+   await context.route('**/*', route => route.fulfill({contentType:'text/html', body:route.request().url().endsWith('/feed') ? `<iframe ${hidden?'hidden':''} src="${src}"></iframe>` : observedFeed(accountLabels)}));
+   const page = await context.newPage();await page.goto('https://www.linkedin.com/feed');
+   assert.equal(await guard.hasSignedInLinkedInEvidence(page),expected);
+  } finally {await context.close();}
+ }
+});

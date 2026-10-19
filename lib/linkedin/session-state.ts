@@ -1,4 +1,4 @@
-import type { BrowserContext, Page } from "playwright";
+import type { BrowserContext, Frame, Page } from "playwright";
 
 export type LinkedInStorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
 
@@ -59,18 +59,43 @@ export function isLinkedInLoginLanding(url: string): boolean {
 export async function hasSignedInLinkedInEvidence(page: Page): Promise<boolean> {
   if (!isLinkedInLoginLanding(page.url())) return false;
   if (!hasUsableLinkedInState(await page.context().storageState())) return false;
+  for (const frame of page.frames()) {
+    if (!await isVisibleLinkedInFrame(frame, page)) continue;
+    if (await hasSignedInFrameEvidence(frame)) return true;
+  }
+  return false;
+}
+
+// The provider can render its application in a same-origin frame. Ignore
+// hidden frames, third-party frames and frames nested under an untrusted host.
+export async function isVisibleLinkedInFrame(frame: Frame, page: Page): Promise<boolean> {
+  if (frame === page.mainFrame()) return true;
+  try {
+    if (new URL(frame.url()).origin !== new URL(page.url()).origin) return false;
+    const parent = frame.parentFrame();
+    if (!parent || !await isVisibleLinkedInFrame(parent, page)) return false;
+    const element = await frame.frameElement();
+    try { return await element.isVisible(); }
+    finally { await element.dispose(); }
+  } catch { return false; }
+}
+
+async function hasSignedInFrameEvidence(frame: Frame): Promise<boolean> {
   // Filter visibility before selecting the first match: responsive layouts may
   // keep a hidden desktop navigation before the visible mobile navigation.
-  // A guest marketing page/redirect URL alone is insufficient evidence.
-  const legacyNavigation = await page.locator('nav .global-nav__me-photo:visible, nav a[href^="/in/"]:visible, a[data-control-name="identity_profile_photo"][href*="/in/"]:visible').first()
+  const legacyNavigation = await frame.locator('nav .global-nav__me-photo:visible, nav a[href^="/in/"]:visible, a[data-control-name="identity_profile_photo"][href*="/in/"]:visible').first()
     .isVisible().catch(() => false);
   if (legacyNavigation) return true;
-  // New layouts need not use legacy CSS classes or an HTML <nav> element.
-  // Require the complete account navigation, not an arbitrary profile/post link.
-  const hrefs = await page.locator('a[href]:visible').evaluateAll(links =>
+  const hrefs = await frame.locator('a[href]:visible').evaluateAll(links =>
     links.map(link => link.getAttribute('href') || '')).catch(() => []);
-  return hasAccountNavigation(hrefs);
-
+  if (hasAccountNavigation(hrefs)) return true;
+  // The observed signed-in feed uses these labels, but links, button roles and
+  // destinations vary between layouts. Require the personal post composer AND
+  // all account navigation labels in the same visible, trusted frame.
+  const labels = ["Home", "My Network", "Jobs", "Messaging", "Notifications", "Me", "Start a post"];
+  const visible = await Promise.all(labels.map(label => frame.getByText(label, { exact: true })
+    .filter({ visible: true }).first().isVisible().catch(() => false)));
+  return visible.every(Boolean);
 }
 
 export function hasAccountNavigation(hrefs: string[]): boolean {
