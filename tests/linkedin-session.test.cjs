@@ -22,8 +22,9 @@ const valid=()=>({cookies:[{name:'li_at',value:'synthetic-fixture-only',domain:'
 beforeEach(async()=>{
  f=globalThis.sessionFixture={state:valid(),stored:JSON.stringify(valid()),visibleNav:true,url:'https://www.linkedin.com/feed/',writes:[],navigations:[],contexts:0,elapsed:0,navChecks:0};
  Date.now=()=>realNow()+f.elapsed;
- const locator={first(){return this},async count(){return 0},async waitFor(){},async fill(){},async press(){},async isVisible(){f.navChecks++;return f.navAfter===undefined?f.visibleNav:f.navChecks>=f.navAfter}};
- f.page={url:()=>f.url,context:()=>f.ctx,locator:()=>locator,getByText:()=>({async count(){return 0}}),async goto(url){f.navigations.push(url)},async waitForLoadState(){},async waitForTimeout(ms){f.elapsed+=ms;if(f.afterWait)f.afterWait()},async close(){}};
+ const locator={first(){return this},async count(){return 0},async evaluateAll(){return []},async waitFor(){},async fill(){},async press(){},async isVisible(){f.navChecks++;return f.navAfter===undefined?f.visibleNav:f.navChecks>=f.navAfter}};
+ f.page={url:()=>f.url,context:()=>f.ctx,locator:()=>locator,getByText:()=>({async count(){return 0},filter(){return this},first(){return this},async isVisible(){return false}}),async goto(url){f.navigations.push(url)},async waitForLoadState(){},async waitForURL(predicate){if(!predicate(new URL(f.url)))throw Error("fixture wait timeout")},async waitForTimeout(ms){f.elapsed+=ms;if(f.afterWait)f.afterWait()},async close(){}};
+ f.page.frames=()=>[f.page];f.page.mainFrame=()=>f.page;
  f.ctx={storageState:async()=>f.state,newPage:async()=>f.page,on(){},async close(){}};
  f.browser={isConnected:()=>true,async newContext(){globalThis.sessionFixture.contexts++;return globalThis.sessionFixture.ctx},async close(){}};
  f.db={prepare(){return {get:()=>({email:'owner@example.test',cookies_json:f.stored}),run:(...values)=>f.writes.push(values)}}};
@@ -52,7 +53,8 @@ test('URL-only guest success refuses authentication and does not persist',async(
  assert.deepEqual(f.navigations,['https://www.linkedin.com/login']);
 });
 test('cookie without positive signed-in navigation does not authenticate',async()=>{
- f.visibleNav=false;assert.equal((await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password')).status,'error');
+ f.visibleNav=false;const result=await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password');
+ assert.equal(result.status,'challenge');assert.equal(result.kind,'session');
  assert.equal(f.writes.length,0);
 });
 test('verified regular login persists before any optional Sales Nav navigation',async()=>{
@@ -108,4 +110,60 @@ test('actual supported import route writes a validator-compatible synthetic stat
  f.writes.length=0;
  await handler({method:'POST',query:{id:'fixture'},body:{li_at:'   '}},reply);
  assert.equal(reply.statusCode,400);assert.equal(f.writes.length,0);
+});
+
+test('bare feed path saves only after both credential and navigation checks',async()=>{
+ f.url='https://www.linkedin.com/feed';
+ assert.equal((await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password')).status,'authenticated');
+ assert.equal(f.writes.length,1);
+});
+test('unconfirmed feed session can be rechecked without submitting the password again',async()=>{
+ f.visibleNav=false;
+ const result=await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password');
+ assert.equal(result.kind,'session');assert.equal(f.writes.length,0);
+ f.visibleNav=true;f.url='https://www.linkedin.com/feed';
+ assert.equal((await api.awaitLoginApproval('fixture')).status,'authenticated');
+ assert.equal(f.writes.length,1);assert.equal(f.contexts,1);
+ assert.deepEqual(f.navigations,['https://www.linkedin.com/login']);
+});
+test('retained session expires and cannot be revived by Continue',async()=>{
+ f.visibleNav=false;await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password');
+ f.elapsed+=11*60_000;f.visibleNav=true;
+ assert.equal((await api.awaitLoginApproval('fixture')).status,'error');assert.equal(f.writes.length,0);
+});
+test('rechecking a retained session never persists an authwall or missing cookie',async()=>{
+ for(const change of [()=>{f.url='https://www.linkedin.com/authwall'},()=>{f.state={cookies:[],origins:[]}}]){
+  f.url='https://www.linkedin.com/feed/';f.state=valid();f.visibleNav=false;
+  await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password');change();
+  assert.equal((await api.awaitLoginApproval('fixture')).status,'error');assert.equal(f.writes.length,0);
+ }
+});
+
+test('LinkedIn documented www domain cookie is accepted without admitting foreign domains',async()=>{
+ for(const domain of ['.www.linkedin.com','www.linkedin.com','.linkedin.com','linkedin.com']){
+  f.state={cookies:[{...valid().cookies[0],domain}],origins:[]};
+  assert.equal(guard.hasUsableLinkedInState(f.state),true);
+  assert.equal((await api.startHeadlessLogin('fixture','owner@example.test','synthetic-password')).status,'authenticated');
+ }
+ for(const domain of ['.www.linkedin.com.evil.test','evil.www.linkedin.com','..www.linkedin.com','.notlinkedin.com']){
+  assert.equal(guard.hasUsableLinkedInState({cookies:[{...valid().cookies[0],domain}],origins:[]}),false);
+ }
+ const legacy={cookies:[{...valid().cookies[0],domain:'.www.linkedin.com',expires:undefined}],origins:[]};
+ assert.equal(guard.hasUsableLinkedInState(guard.normalizeLegacyLinkedInState(legacy)),true);
+});
+
+test('readiness page opener uses only the EXISTING context, never creates one, and is registered by the owner',async()=>{
+ f.ctx.browser=()=>f.browser;
+ await assert.rejects(api.getExistingContextPage('fixture',f.ctx),{name:'LinkedInSessionUnavailableError'});
+ assert.equal(f.contexts,0,'no context is created for readiness');
+ const ctx=await api.getSessionContext('fixture');assert.equal(f.contexts,1);
+ const page=await api.getExistingContextPage('fixture',ctx);
+ assert.equal(page,f.page);assert.equal(f.contexts,1);assert.equal(f.navigations.length,0);await page.close();
+ await assert.rejects(api.getExistingContextPage('fixture',{...ctx,browser:()=>f.browser}),{name:'LinkedInSessionUnavailableError'});
+ const readiness=await import(pathToFileURL(path.join(root,'lib/linkedin/readiness-session.ts')).href);
+ assert.equal(globalThis.__linkiExistingPageOpener,api.getExistingContextPage);
+ assert.equal(readiness.existingContexts.get('fixture'),ctx);
+ f.browser.isConnected=()=>false;
+ await assert.rejects(api.getExistingContextPage('fixture',ctx),{name:'LinkedInSessionUnavailableError'});
+ f.browser.isConnected=()=>true;
 });

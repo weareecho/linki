@@ -1,3 +1,4 @@
+import { nextAccountSlot } from "@/lib/linkedin/schedule";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
@@ -87,38 +88,12 @@ function isWithinSchedule(account: ScheduleConfig): boolean {
   return frac >= (account.active_hours_start ?? 9) && frac < (account.active_hours_end ?? 18);
 }
 
-function randomSlotInActiveWindow(account: ScheduleConfig, targetDate?: Date): string {
-  const start = account.active_hours_start ?? 9;
-  const end = account.active_hours_end ?? 18;
-  const base = targetDate ? new Date(targetDate) : new Date();
-  const startMs = new Date(base.getFullYear(), base.getMonth(), base.getDate(), start, 0, 0).getTime();
-  const endMs   = new Date(base.getFullYear(), base.getMonth(), base.getDate(), end,   0, 0).getTime();
-  return new Date(startMs + Math.random() * (endMs - startMs)).toISOString();
-}
-
 function rescheduleToTomorrow(account: ScheduleConfig): string {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return randomSlotInActiveWindow(account, tomorrow);
+  return nextAccountSlot(account, { nextDay: true });
 }
 
 function nextScheduledSlot(account: ScheduleConfig): string {
-  const tz = account.timezone || "UTC";
-  const allowedDays = (account.working_days || "1,2,3,4,5").split(",").map(Number);
-  const end = account.active_hours_end ?? 18;
-  const { hour: nowHour, minute: nowMin, isoWeekday: nowDay } = getLocalParts(tz);
-  const nowFrac = nowHour + nowMin / 60;
-  if (allowedDays.includes(nowDay) && nowFrac < end - 0.25) {
-    const remaining = (end - nowFrac) * 3600_000;
-    return new Date(Date.now() + Math.random() * remaining).toISOString();
-  }
-  const candidate = new Date();
-  for (let i = 1; i <= 14; i++) {
-    candidate.setDate(candidate.getDate() + 1);
-    const { isoWeekday } = getLocalParts(tz, candidate);
-    if (allowedDays.includes(isoWeekday)) return randomSlotInActiveWindow(account, candidate);
-  }
-  return new Date(Date.now() + 86_400_000).toISOString();
+  return nextAccountSlot(account);
 }
 
 interface WorkflowStep {
@@ -526,7 +501,7 @@ async function executeStep(
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
       const page = await getSessionPage(accountId);
       let visitResult: { isFirstDegree: boolean; messagingUrn: string | null };
-      try { visitResult = await visitProfile(page, linkedinUrl); } finally { await page.close(); }
+      try { visitResult = await visitProfile(page, linkedinUrl, target.full_name || undefined); } finally { await page.close(); }
       await saveSessionState(accountId);
       if (visitResult.isFirstDegree && target.degree !== 1) {
         db.prepare("UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?").run(nowIso(), target.id);
@@ -583,7 +558,7 @@ async function executeStep(
         await sendConnectionRequest(page, linkedinUrl, async () => {
           if (echoScope) await assertEchoEligible({ ...echoScope, profile: linkedinUrl }, "claim");
           recordUnknownInvitationOutcome(db, target.id, linkedinUrl);
-        }, echoScope ? { note: echoScope.note, fullName: echoScope.full_name } : undefined);
+        }, echoScope ? { note: echoScope.note, fullName: echoScope.full_name } : undefined, target.full_name || undefined);
       } finally { await page.close(); }
       await saveSessionState(accountId);
       db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
@@ -599,6 +574,10 @@ async function executeStep(
       log(db, runId, target.id, "info", `Connection request sent to ${name} — will recheck in ${CONNECTION_RECHECK_HOURS}h`);
 
     } else if (step.step_type === "message") {
+      const messageFence = `linkedin-message-outcome-unknown:${target.id}`;
+      if (db.prepare("SELECT value FROM app_settings WHERE key = ?").get(messageFence)) {
+        throw new Error("Previous message outcome unresolved; reconcile the exact conversation before retrying");
+      }
       await ensureSalesNavEnriched(db, target, accountId);
       if (!enforceSchedule(db, tr, runId, target.id, name, accountLimits)) return;
 
@@ -683,7 +662,10 @@ async function executeStep(
       const page = await getSessionPage(accountId);
       try {
         if (!target.full_name) throw new Error(`Target ${target.id} has no full_name — cannot search messaging`);
-        const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn);
+        const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn, () => {
+          db.prepare("INSERT INTO app_settings (key,value) VALUES (?,?)").run(messageFence,
+            JSON.stringify({ profile: messageLinkedinUrl, text: messageText, runId, attemptedAt: nowIso() }));
+        });
         if (result.messagingUrn) {
           db.prepare("UPDATE targets SET messaging_urn = COALESCE(messaging_urn, ?) WHERE id = ?").run(result.messagingUrn, target.id);
         }
@@ -700,10 +682,13 @@ async function executeStep(
         await page.close();
       }
       await saveSessionState(accountId);
-      db.prepare("UPDATE targets SET message_sent_at = ? WHERE id = ?").run(nowIso(), target.id);
-      trRecordContext(db, tr, { linkedinMessage: messageText });
-      trAdvance(db, tr, steps);
-      log(db, runId, target.id, "info", `Message sent to ${name}`);
+      db.transaction(() => {
+        db.prepare("UPDATE targets SET message_sent_at = ? WHERE id = ?").run(nowIso(), target.id);
+        trRecordContext(db, tr, { linkedinMessage: messageText });
+        trAdvance(db, tr, steps);
+        log(db, runId, target.id, "info", `Message sent to ${name}`);
+        db.prepare("DELETE FROM app_settings WHERE key = ?").run(messageFence);
+      })();
 
     } else if (step.step_type === "sales_inmail") {
       // Sales Navigator InMail — reaches NON-connections (no degree gate), needs a
@@ -1450,13 +1435,6 @@ function spreadEnrollBatch(
 ) {
   const batchSize = pending.length;
   if (batchSize === 0) return;
-  const start = limits.active_hours_start ?? 9;
-  const end = limits.active_hours_end ?? 18;
-  const { hour, minute } = getLocalParts(limits.timezone || "UTC");
-  const nowFrac = hour + minute / 60;
-  const windowMs = (end - start) * 3600_000;
-  const bucketMs = windowMs / batchSize;
-  const dayStartMs = new Date().setHours(start, 0, 0, 0);
 
   for (let i = 0; i < pending.length; i++) {
     const row = pending[i];
@@ -1464,12 +1442,7 @@ function spreadEnrollBatch(
       "UPDATE run_profile_tracks SET state = 'in_progress' WHERE id = ? AND state = 'pending'"
     ).run(row.id);
     if (claimed.changes === 0) continue;
-    const slot = (() => {
-      if (nowFrac >= end - 0.25) return rescheduleToTomorrow(limits);
-      const bucketStart = dayStartMs + i * bucketMs;
-      const bucketEnd = bucketStart + bucketMs;
-      return new Date(bucketStart + Math.random() * (bucketEnd - bucketStart)).toISOString();
-    })();
+    const slot = nextAccountSlot(limits, { fraction: (i + Math.random()) / batchSize });
     db.prepare("UPDATE run_profile_tracks SET next_step_at = ? WHERE id = ?").run(slot, row.id);
     const tgt = db.prepare("SELECT full_name, linkedin_url FROM targets WHERE id = (SELECT target_id FROM run_profiles WHERE id = ?)").get(row.run_profile_id) as { full_name: string | null; linkedin_url: string } | undefined;
     log(db, runId, null, "info", `[${track}] Scheduled ${tgt?.full_name ?? tgt?.linkedin_url ?? row.run_profile_id} within active window`);

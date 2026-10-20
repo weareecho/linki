@@ -283,8 +283,8 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
       // Stop at the challenge; never suggest transferring cookies as a bypass.
     } else if (data.status === "challenge") {
       setChallengeMsg(data.message ?? "");
-      if (data.kind === "app") {
-        if (loginStage === "approve") toast.error("Still waiting — approve the request in your LinkedIn app, then click Continue.");
+      if (data.kind === "app" || data.kind === "session") {
+        if (loginStage === "approve" && data.kind === "app") toast.error("Still waiting — approve the request in your LinkedIn app, then click Continue.");
         setLoginStage("approve");
       } else {
         setLoginStage("code");
@@ -583,7 +583,7 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
                 <div className="modal-action mt-1">
                   <button type="button" className="inline-flex items-center px-3 py-1.5 rounded-lg text-sm text-base-content/60 hover:text-base-content hover:bg-base-300/50 transition-colors" onClick={closeAuthModal}>Cancel</button>
                   <button type="submit" className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-sm font-medium bg-primary text-primary-content hover:bg-primary/90 transition-colors disabled:opacity-50" disabled={authLoading}>
-                    {authLoading ? <span className="loading loading-spinner loading-xs" /> : loginStage === "creds" ? "Log in" : loginStage === "approve" ? "I approved — Continue" : "Verify code"}
+                    {authLoading ? <span className="loading loading-spinner loading-xs" /> : loginStage === "creds" ? "Log in" : loginStage === "approve" ? "Continue" : "Verify code"}
                   </button>
                 </div>
               </form>

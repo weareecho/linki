@@ -1,6 +1,11 @@
 // Echo only: reuse the existing internal secret, never send it to a public URL.
 import { BUILT_GUARD_REVISION } from "./readiness-artifact";
 export const ECHO_GUARD_ARTIFACT_REVISION = BUILT_GUARD_REVISION;
+// One request, never retried. Echo's bridge locks the contact and rechecks
+// suppression, replies and every email/profile alias in its production DB on
+// each call; measured ~10 s warm (two full alias scans), ~15 s after a DB
+// reconnect. A shorter bound paused every managed run at its first step.
+export const ECHO_GUARD_TIMEOUT_MS = 30_000;
 
 export class EchoEligibilityError extends Error {
   constructor() { super("Echo eligibility unavailable, revoked or uncertain; hold for owner review."); }
@@ -28,7 +33,7 @@ export async function assertEchoEligible(scope: EchoScope, mode: "check" | "clai
     if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "host.docker.internal"].includes(url.hostname)
         || url.username || url.password || url.pathname !== "/echo/action" || url.search || url.hash) throw new EchoEligibilityError();
     const response = await fetcher(url, {
-      method: "POST", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(5000),
+      method: "POST", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(ECHO_GUARD_TIMEOUT_MS),
       headers: { "content-type": "application/json", "x-internal-secret": secret },
       body: JSON.stringify({ ...scope, mode }),
     });

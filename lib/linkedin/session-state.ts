@@ -1,4 +1,4 @@
-import type { BrowserContext, Page } from "playwright";
+import type { BrowserContext, Frame, Page } from "playwright";
 
 export type LinkedInStorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
 
@@ -19,7 +19,7 @@ export function normalizeLegacyLinkedInState(state: unknown): unknown {
   return { ...value, cookies: value.cookies.map(cookie => {
     if (!cookie || typeof cookie !== "object" || cookie.expires !== undefined ||
       typeof cookie.name !== "string" || typeof cookie.value !== "string" ||
-      ![".linkedin.com", "linkedin.com", "www.linkedin.com"].includes(cookie.domain) || cookie.path !== "/") return cookie;
+      ![".linkedin.com", "linkedin.com", ".www.linkedin.com", "www.linkedin.com"].includes(cookie.domain) || cookie.path !== "/") return cookie;
     return { httpOnly: false, secure: true, sameSite: "Lax", ...cookie, expires: -1 };
   }) };
 }
@@ -42,7 +42,7 @@ export function hasUsableLinkedInState(state: unknown, nowSeconds = Date.now() /
   if (!Array.isArray(value.cookies) || !Array.isArray(value.origins)) return false;
   return value.cookies.some(cookie => cookie && typeof cookie === "object" &&
     cookie.name === "li_at" && typeof cookie.value === "string" && cookie.value.trim().length > 0 &&
-    [".linkedin.com", "linkedin.com", "www.linkedin.com"].includes(cookie.domain) &&
+    [".linkedin.com", "linkedin.com", ".www.linkedin.com", "www.linkedin.com"].includes(cookie.domain) &&
     typeof cookie.expires === "number" && Number.isFinite(cookie.expires) &&
     (cookie.expires === -1 || cookie.expires > nowSeconds));
 }
@@ -51,16 +51,63 @@ export function isLinkedInLoginLanding(url: string): boolean {
   try {
     const value = new URL(url);
     return value.protocol === "https:" && ["www.linkedin.com", "linkedin.com"].includes(value.hostname) &&
-      (value.pathname.startsWith("/feed/") || value.pathname.startsWith("/sales/"));
+      !value.username && !value.password && !value.port &&
+      /^\/(feed|sales)(?:\/|$)/.test(value.pathname);
   } catch { return false; }
 }
 
 export async function hasSignedInLinkedInEvidence(page: Page): Promise<boolean> {
   if (!isLinkedInLoginLanding(page.url())) return false;
   if (!hasUsableLinkedInState(await page.context().storageState())) return false;
-  // A guest marketing page/redirect URL alone is insufficient evidence.
-  return page.locator('nav .global-nav__me-photo, nav a[href^="/in/"], a[data-control-name="identity_profile_photo"][href*="/in/"]').first()
+  for (const frame of page.frames()) {
+    if (!await isVisibleLinkedInFrame(frame, page)) continue;
+    if (await hasSignedInFrameEvidence(frame)) return true;
+  }
+  return false;
+}
+
+// The provider can render its application in a same-origin frame. Ignore
+// hidden frames, third-party frames and frames nested under an untrusted host.
+export async function isVisibleLinkedInFrame(frame: Frame, page: Page): Promise<boolean> {
+  if (frame === page.mainFrame()) return true;
+  try {
+    if (new URL(frame.url()).origin !== new URL(page.url()).origin) return false;
+    const parent = frame.parentFrame();
+    if (!parent || !await isVisibleLinkedInFrame(parent, page)) return false;
+    const element = await frame.frameElement();
+    try { return await element.isVisible(); }
+    finally { await element.dispose(); }
+  } catch { return false; }
+}
+
+async function hasSignedInFrameEvidence(frame: Frame): Promise<boolean> {
+  // Filter visibility before selecting the first match: responsive layouts may
+  // keep a hidden desktop navigation before the visible mobile navigation.
+  const legacyNavigation = await frame.locator('nav .global-nav__me-photo:visible, nav a[href^="/in/"]:visible, a[data-control-name="identity_profile_photo"][href*="/in/"]:visible').first()
     .isVisible().catch(() => false);
+  if (legacyNavigation) return true;
+  const hrefs = await frame.locator('a[href]:visible').evaluateAll(links =>
+    links.map(link => link.getAttribute('href') || '')).catch(() => []);
+  if (hasAccountNavigation(hrefs)) return true;
+  // The observed signed-in feed uses these labels, but links, button roles and
+  // destinations vary between layouts. Require the personal post composer AND
+  // all account navigation labels in the same visible, trusted frame.
+  const labels = ["Home", "My Network", "Jobs", "Messaging", "Notifications", "Me", "Start a post"];
+  const visible = await Promise.all(labels.map(label => frame.getByText(label, { exact: true })
+    .filter({ visible: true }).first().isVisible().catch(() => false)));
+  return visible.every(Boolean);
+}
+
+export function hasAccountNavigation(hrefs: string[]): boolean {
+  const paths = new Set<string>();
+  for (const href of hrefs) {
+    try {
+      const url = new URL(href, "https://www.linkedin.com");
+      if (url.protocol === "https:" && ["www.linkedin.com", "linkedin.com"].includes(url.hostname) &&
+          !url.username && !url.password && !url.port) paths.add(url.pathname.replace(/\/$/, ""));
+    } catch { /* malformed links provide no evidence */ }
+  }
+  return ["/feed", "/mynetwork", "/jobs", "/messaging", "/notifications"].every(path => paths.has(path));
 }
 
 // Do not log provider URLs: checkpoint paths and query strings can contain secrets.

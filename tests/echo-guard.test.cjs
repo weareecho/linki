@@ -14,6 +14,7 @@ function load(file,stubs={},extra='') {
  vm.runInNewContext(js,{module,exports:module.exports,require:id=>id in stubs?stubs[id]:require(id),process,URL,AbortSignal,fetch:(...args)=>global.fetch(...args),global,console,Date,setTimeout,clearTimeout},{filename:file});
  return module.exports;
 }
+const schedule=load('lib/linkedin/schedule.ts');
 const guard=load('lib/linkedin/echo-guard.ts',{'./readiness-artifact':{BUILT_GUARD_REVISION:''}});
 const connect=load('lib/linkedin/connect.ts');
 const csv=load('lib/csv-import.ts');
@@ -44,6 +45,7 @@ beforeEach(()=>{
  db.prepare('INSERT INTO run_profile_tracks(id,run_profile_id,state,current_step) VALUES (?,?,?,0)').run('fixture-track','fixture-profile','pending');
  const boundary=async()=>{throw new Error('Unexpected provider/enrichment boundary')};
  runner=load('lib/linkedin/runner.ts',{
+  '@/lib/linkedin/schedule':schedule,
   '@/lib/db':{getDb:()=>db},
   '@/lib/linkedin/echo-guard':guard,
   '@/lib/linkedin/readiness-artifact':{recordExecutorStarted:()=>{},recordExecutorStopped:()=>{}},
@@ -96,4 +98,11 @@ test('cleared editable notes do not bypass durable Echo origin',async()=>{
 });
 test('unscoped Echo workflow is held before provider access',async()=>{
  db.prepare('UPDATE workflows SET name=?').run('Echo outreach');db.prepare('UPDATE targets SET notes=NULL').run();await execute();assert.equal(actions,0);assert.equal(pages,0);assert.equal(db.prepare('SELECT status FROM runs').get().status,'paused');
+});
+
+test('guard waits long enough for the bridge production DB checks, still one request',async()=>{
+ assert.equal(guard.ECHO_GUARD_TIMEOUT_MS,30000);
+ let calls=0,signal=null;
+ await assert.rejects(guard.assertEchoEligible(scope(),'check',async(url,options)=>{calls++;signal=options.signal;throw new Error('Synthetic abort')}),guard.EchoEligibilityError);
+ assert.equal(calls,1);assert.ok(signal&&typeof signal.aborted==='boolean');
 });
