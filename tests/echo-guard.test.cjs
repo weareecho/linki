@@ -21,11 +21,11 @@ const csv=load('lib/csv-import.ts');
 const fingerprint='a'.repeat(64),note='Hi Ada, I’m Kayvon, co-founder of Echo. Would love to connect.';
 const notes=`Echo reservation ${fingerprint}; approved connection note: ${note}`;
 const data={list_id:'fixture-list',account_id:'fixture-account',profile:'https://www.linkedin.com/in/ada',full_name:'Ada Lovelace',company:'Analytical Engines'};
-let db,oldFetch,oldURL,oldSecret,modes,actions,pages,denyMode,runner;
+let db,oldFetch,oldURL,oldSecret,modes,actions,pages,denyMode,runner,connectFailure;
 beforeEach(()=>{
  oldFetch=global.fetch;oldURL=process.env.ECHO_GUARD_URL;oldSecret=process.env.INTERNAL_API_SECRET;
  process.env.ECHO_GUARD_URL='http://127.0.0.1:3457/echo/action';process.env.INTERNAL_API_SECRET='synthetic-existing-secret';
- modes=[];actions=0;pages=0;denyMode=null;
+ modes=[];actions=0;pages=0;denyMode=null;connectFailure=null;
  global.fetch=async(url,opts)=>{
    const payload=JSON.parse(opts.body);modes.push(payload.mode);
    assert.equal(payload.account_id,data.account_id);assert.equal(payload.note,note);
@@ -49,7 +49,7 @@ beforeEach(()=>{
   '@/lib/db':{getDb:()=>db},
   '@/lib/linkedin/echo-guard':guard,
   '@/lib/linkedin/readiness-artifact':{recordExecutorStarted:()=>{},recordExecutorStopped:()=>{}},
-  '@/lib/linkedin/connect':{...connect,sendConnectionRequest:async(page,url,before,approved)=>{assert.deepEqual(JSON.parse(JSON.stringify(approved)),{note,fullName:data.full_name});await before();actions++;}},
+  '@/lib/linkedin/connect':{...connect,sendConnectionRequest:async(page,url,before,approved)=>{assert.deepEqual(JSON.parse(JSON.stringify(approved)),{note,fullName:data.full_name});if(connectFailure)throw connectFailure;await before();actions++;}},
   '@/lib/linkedin/session':{getSessionPage:async()=>{pages++;return {close:async()=>{}}},saveSessionState:async()=>{},getSessionContext:boundary},
   '@/lib/linkedin/visit':{visitProfile:boundary},'@/lib/linkedin/message':{sendMessage:boundary},
   '@/lib/linkedin/sync-accepted':{},'@/lib/email/sender':{sendEmail:boundary},'@/lib/email/inbox':{},
@@ -92,6 +92,14 @@ test('successful guarded initial connection completes with no followup',async()=
 });
 test('completion uncertainty keeps durable hold and cannot resend',async()=>{
  denyMode='complete';await execute();assert.equal(actions,1);assert.ok(connect.hasUnresolvedInvitationOutcome(db,'fixture-target',data.profile));await execute();assert.equal(actions,1);assert.equal(db.prepare('SELECT status FROM runs').get().status,'paused');
+});
+test('note invitation unavailable pauses the whole run before the next person; no claim, hold or failed track',async()=>{
+ connectFailure=new connect.NoteInvitationUnavailableError('Unique Add a note control absent; stop.');
+ await execute();
+ assert.deepEqual(modes,['check']);assert.equal(actions,0);
+ assert.equal(db.prepare('SELECT status FROM runs').get().status,'paused');
+ assert.notEqual(db.prepare('SELECT state FROM run_profile_tracks').get().state,'failed');
+ assert.equal(connect.hasUnresolvedInvitationOutcome(db,'fixture-target',data.profile),false);
 });
 test('cleared editable notes do not bypass durable Echo origin',async()=>{
  db.prepare('INSERT INTO app_settings VALUES (?,?)').run('echo-scope:fixture-target',notes);db.prepare('UPDATE targets SET notes=NULL').run();await execute('email');assert.equal(actions,0);assert.equal(pages,0);assert.equal(db.prepare('SELECT status FROM runs').get().status,'paused');

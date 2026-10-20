@@ -10,21 +10,22 @@ const target='https://www.linkedin.com/in/target-fixture';
 const invite='/preload/custom-invite/?vanityName=target-fixture';
 function dialog(){return `${state.weeklyLimit?'<div class="ip-fuse-limit-alert__warning">Synthetic weekly limit</div>':''}<div role="dialog"><p id="fixture-recipient">${state.recipientDelay?'':state.wrongDialog?'Other Fixture':'Target Fixture'}</p>${state.noteEditor?'<button onclick="window.activateNote(this)">Add a note</button><textarea id="fixture-note" hidden></textarea>':''}${state.missingSend?'':`<button data-fixture-send ${state.sendDelay?'hidden':''} onclick="window.fixtureSent().then(()=>this.closest('[role=dialog]').remove())">Send without a note</button>`}</div>`;}
 
-function profile(){return `<aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other first</a></aside><main><section><${state.modernHeading?"h2":"h1"}>Target Fixture</${state.modernHeading?"h2":"h1"}>${state.pending&&!state.pendingDelay?'<button aria-label="Pending">Pending</button>':state.connected?'<span>1st</span>':'<span>2nd</span>'}${state.more?`<button aria-label="More" aria-controls="own-menu" onclick="document.querySelector('#own-menu').hidden=false">More</button><div role="menu" id="own-menu" hidden><button role="menuitem" onclick="setTimeout(()=>{document.body.insertAdjacentHTML('beforeend',window.dialogHtml);window.finishDialog()},${state.dialogDelay||0})">Connect</button></div>`:`<a aria-label="Invite Target Fixture to connect" href="${state.wrongLink?'/preload/custom-invite/?vanityName=other-fixture':invite}">Connect</a>`}</section><aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other Connect</a><button aria-label="Pending">Pending</button><button aria-label="More">More</button></aside></main>`;}
+function profile(){return `<aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other first</a></aside><main><section><${state.modernHeading?"h2":"h1"}>Target Fixture</${state.modernHeading?"h2":"h1"}>${state.pending&&!state.pendingDelay?'<button aria-label="Pending">Pending</button>':state.connected?'<span>1st</span>':'<span>2nd</span>'}${state.connectButton?`<button aria-label="Invite Target Fixture to connect" onclick="window.fixtureClicked();window.fixtureSent()">Connect</button>`:state.more?`<button aria-label="More" aria-controls="own-menu" onclick="window.fixtureClicked();document.querySelector('#own-menu').hidden=false">More</button><div role="menu" id="own-menu" hidden><button role="menuitem" onclick="setTimeout(()=>{document.body.insertAdjacentHTML('beforeend',window.dialogHtml);window.finishDialog()},${state.dialogDelay||0})">Connect</button></div>`:`<a aria-label="Invite Target Fixture to connect" href="${state.wrongLink?'/preload/custom-invite/?vanityName=other-fixture':invite}">Connect</a>`}</section><aside><a aria-label="Invite Other Fixture to connect" href="/preload/custom-invite/?vanityName=other-fixture">Other Connect</a><button aria-label="Pending">Pending</button><button aria-label="More">More</button></aside></main>`;}
 before(async()=>{
  api=await import(pathToFileURL(path.join(process.cwd(),'lib/linkedin/connect.ts')).href);
  browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,args:['--no-sandbox','--disable-dev-shm-usage']});
 });
 after(async()=>{if(browser)await browser.close()});
 beforeEach(async()=>{
- state={pending:false,sends:0,visits:[],missingSend:false,more:false};
+ state={pending:false,sends:0,clicks:0,visits:[],missingSend:false,more:false};
  context=await browser.newContext();page=await context.newPage();
  await page.exposeFunction('fixtureSent',()=>{state.sends++;if(!state.unknown&&!state.blockAfterSend)state.pending=true});
+ await page.exposeFunction('fixtureClicked',()=>{state.clicks++});
  await context.route('**/*',async route=>{
   const url=route.request().url();state.visits.push(url);
   if(!route.request().isNavigationRequest())return route.abort();
   if(state.redirect&&url===target)return route.fulfill({status:200,contentType:'text/html',body:'<script>history.replaceState(null,"","/authwall")</script><main><h1>Join LinkedIn</h1></main>'});
-  const markup=url.includes('custom-invite')?dialog():profile();
+  const markup=url.includes('custom-invite')&&!state.noDialogPage?dialog():profile();
   return route.fulfill({status:state.blockAfterSend&&state.sends?999:200,contentType:'text/html',body:markup+`<script>
 window.dialogHtml=${JSON.stringify(dialog())};
 window.activateNote=(button)=>{button.hidden=true;document.querySelector("#fixture-note").hidden=false;document.querySelector("[data-fixture-send]").textContent="Send"};
@@ -125,8 +126,8 @@ test('Echo exact approved note and recipient precede one confirmed send',async()
 });
 test('Echo cannot fall back to an immediate no-note More action',async()=>{
  state.more=true;let calls=0;
- await assert.rejects(api.sendConnectionRequest(page,target,()=>calls++,approved),api.TargetProfileMismatchError);
- assert.equal(calls,0);assert.equal(state.sends,0);
+ await assert.rejects(api.sendConnectionRequest(page,target,()=>calls++,approved),api.NoteInvitationUnavailableError);
+ assert.equal(calls,0);assert.equal(state.sends,0);assert.equal(state.clicks,0);
 });
 test('Echo mismatching approved full recipient cannot invite',async()=>{
  state.noteEditor=true;
@@ -134,8 +135,26 @@ test('Echo mismatching approved full recipient cannot invite',async()=>{
  assert.equal(state.sends,0);
 });
 test('Echo without Add a note never sends without a note',async()=>{
- await assert.rejects(api.sendConnectionRequest(page,target,undefined,approved),api.TargetProfileMismatchError);
+ await assert.rejects(api.sendConnectionRequest(page,target,undefined,approved),api.NoteInvitationUnavailableError);
  assert.equal(state.sends,0);
+});
+const exactInvite='https://www.linkedin.com/preload/custom-invite/?vanityName=target-fixture';
+for(const layout of ['connectButton','more'])test('Echo note invitation without a card link opens the exact invite page and never clicks '+layout,async()=>{
+ state[layout]=true;state.noteEditor=true;let calls=0;
+ await api.sendConnectionRequest(page,target,()=>{calls++;assert.equal(state.sends,0)},approved);
+ assert.equal(state.clicks,0);assert.equal(calls,1);assert.equal(state.sends,1);assert.equal(state.pending,true);
+ assert.ok(state.visits.includes(exactInvite));
+ assert.ok(!state.visits.some(u=>u.includes('other-fixture')));
+});
+test('Echo invite page without a dialog stops as unavailable: no click, claim, send or unknown hold',async()=>{
+ state.connectButton=true;state.noDialogPage=true;state.noteEditor=true;let calls=0;
+ await assert.rejects(api.sendConnectionRequest(page,target,()=>calls++,approved),
+   e=>e instanceof api.NoteInvitationUnavailableError&&!(e instanceof api.InvitationOutcomeUnknownError));
+ assert.equal(state.clicks,0);assert.equal(calls,0);assert.equal(state.sends,0);
+});
+test('note invitation URL is exactly the target member',()=>{
+ assert.equal(api.noteInvitationUrl('target-fixture'),exactInvite);
+ assert.equal(api.noteInvitationUrl('a b&c'),'https://www.linkedin.com/preload/custom-invite/?vanityName=a%20b%26c');
 });
 test('Echo revoked or unavailable action-time claim prevents Send',async()=>{
  state.noteEditor=true;let calls=0;
