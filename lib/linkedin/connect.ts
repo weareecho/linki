@@ -24,6 +24,16 @@ export class WeeklyLimitError extends Error {}
 export class AlreadyConnectedError extends Error {}
 export class PendingInviteError extends Error {}
 export class TargetProfileMismatchError extends Error {}
+/** LinkedIn will not offer a note-scoped invitation here (no invite dialog, no
+ * "Add a note" or no note editor). Nothing was clicked or sent. It is a layout
+ * or account condition, not about one person, so the runner pauses the run. */
+export class NoteInvitationUnavailableError extends TargetProfileMismatchError {}
+
+/** LinkedIn's own note-invitation page for an exact member (the href its
+ * profile "Connect" links use). Opening it is a navigation, never a send. */
+export function noteInvitationUrl(slug: string): string {
+  return `https://www.linkedin.com/preload/custom-invite/?vanityName=${encodeURIComponent(slug)}`;
+}
 export class LinkedInAccessBlockedError extends Error {}
 export class InvitationOutcomeUnknownError extends Error {
   constructor(public readonly sendAttempted: boolean) {
@@ -122,10 +132,16 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
       if (!inviteResponse || inviteResponse.status() >= 400 || !inviteMatchesTarget(page.url(), slug)) {
         throw new LinkedInAccessBlockedError("Target invitation page unavailable; stop.");
       }
+    } else if (approved) {
+      // Button/menu layouts may invite immediately without a note, which
+      // Echo's note-scoped approval cannot authorize, so they are never
+      // clicked. Open the exact target's own invitation page instead; the
+      // dialog, recipient, note and Send checks below all still apply.
+      const inviteResponse = await page.goto(noteInvitationUrl(slug), { waitUntil: "domcontentloaded", timeout: 30000 });
+      if (!inviteResponse || inviteResponse.status() >= 400 || !inviteMatchesTarget(page.url(), slug)) {
+        throw new NoteInvitationUnavailableError("Target invitation page unavailable; stop.");
+      }
     } else {
-      // Button/menu layouts may invite immediately without a note. Echo's
-      // note-scoped approval cannot authorize that side effect.
-      if (approved) throw new TargetProfileMismatchError("Note-scoped invitation requires an exact target invitation link; stop.");
       const connect = card.getByRole("button", { name: /^(Connect|Invite .+ to connect)$/ });
       if (await connect.count() === 1) {
         const label = await connect.getAttribute("aria-label");
@@ -160,7 +176,10 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     if (!await observeRendering(page, async () => {
       if (await dialogs.count() > 1) throw new TargetProfileMismatchError("Ambiguous invitation dialogs; stop.");
       return await dialogs.count() === 1 && await dialogs.first().isVisible();
-    })) throw new InvitationOutcomeUnknownError(sendAttempted);
+    })) {
+      if (approved && !sendAttempted) throw new NoteInvitationUnavailableError("Invitation dialog did not open; stop.");
+      throw new InvitationOutcomeUnknownError(sendAttempted);
+    }
     const dialog = dialogs.first();
     // The explicit recipient name is mandatory before the final send click.
     const recipient = dialog.getByText(name, { exact: true });
@@ -172,11 +191,11 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     }
     if (approved) {
       const add = dialog.getByRole("button", { name: "Add a note", exact: true });
-      if (await add.count() !== 1) throw new TargetProfileMismatchError("Unique Add a note control absent; stop.");
+      if (await add.count() !== 1) throw new NoteInvitationUnavailableError("Unique Add a note control absent; stop.");
       await add.click();
       const textbox = dialog.getByRole("textbox");
       if (!await observeRendering(page, async () => await textbox.count() === 1 && await textbox.isVisible())) {
-        throw new TargetProfileMismatchError("Unique note editor absent; stop.");
+        throw new NoteInvitationUnavailableError("Unique note editor absent; stop.");
       }
       await textbox.fill(approved.note);
       if (await textbox.inputValue() !== approved.note) throw new TargetProfileMismatchError("Invitation note changed; stop.");

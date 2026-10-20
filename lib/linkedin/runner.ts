@@ -3,7 +3,7 @@ import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
 import { visitProfile } from "@/lib/linkedin/visit";
-import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError, InvitationOutcomeUnknownError, hasUnresolvedInvitationOutcome, recordUnknownInvitationOutcome, clearConfirmedInvitationOutcome } from "@/lib/linkedin/connect";
+import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError, InvitationOutcomeUnknownError, NoteInvitationUnavailableError, hasUnresolvedInvitationOutcome, recordUnknownInvitationOutcome, clearConfirmedInvitationOutcome } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { sendEmail } from "@/lib/email/sender";
@@ -950,6 +950,13 @@ async function executeStep(
     }
     if (err instanceof WeeklyLimitError) {
       log(db, runId, target.id, "error", `Weekly connection limit reached — pausing run`);
+      db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
+      return;
+    }
+    if (err instanceof NoteInvitationUnavailableError) {
+      // Same for every person in a note-scoped campaign: stop before the next
+      // visit instead of failing them one by one. The track stays retryable.
+      log(db, runId, target.id, "error", `Note-scoped invitation unavailable (${msg}) — pausing run`);
       db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
       return;
     }
