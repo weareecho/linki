@@ -226,6 +226,18 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     })) {
       throw new TargetProfileMismatchError("Invitation dialog recipient is not verified; stop.");
     }
+    // LinkedIn's note view replaces the dialog content and no longer shows the
+    // name. A name element still attached must still read exactly the verified
+    // name; once LinkedIn removes it, an approved invitation is held to the
+    // exact target by that target's own invitation page and the single dialog.
+    const verifiedRecipient = approved ? await recipient.elementHandle() : null;
+    const sameTarget = async (visible: boolean): Promise<boolean> => {
+      if (!approved) return await recipient.count() === 1 && (!visible || await recipient.isVisible());
+      const shown = await verifiedRecipient?.evaluate(node => node.isConnected
+        ? (node.textContent || "").replace(/\s+/g, " ").trim() : null).catch(() => null);
+      if (shown !== null && shown !== undefined && shown !== name) return false;
+      return inviteMatchesTarget(page.url(), slug);
+    };
     if (approved) {
       const add = dialog.getByRole("button", { name: "Add a note", exact: true });
       if (await add.count() !== 1) throw new NoteInvitationUnavailableError("Unique Add a note control absent; stop.");
@@ -237,17 +249,17 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
       await textbox.fill(approved.note);
       if (await textbox.inputValue() !== approved.note) throw new TargetProfileMismatchError("Invitation note changed; stop.");
     }
-    const send = dialog.getByRole("button", { name: approved ? /^Send$/ : /^(Send without a note|Send now)$/ });
+    const send = dialog.getByRole("button", { name: approved ? /^(Send|Send invitation)$/ : /^(Send without a note|Send now)$/ });
     if (!await observeRendering(page, async () => {
-      if (await dialogs.count() !== 1 || await send.count() > 1 || await recipient.count() !== 1) throw new TargetProfileMismatchError("Invitation recipient or controls changed; stop.");
+      if (await dialogs.count() !== 1 || await send.count() > 1 || !await sameTarget(false)) throw new TargetProfileMismatchError("Invitation recipient or controls changed; stop.");
       return await send.count() === 1 && await send.isVisible() && await send.isEnabled();
     })) throw new InvitationOutcomeUnknownError(sendAttempted);
     await assertNoProviderRejection(page);
-    if (await dialogs.count() !== 1 || await recipient.count() !== 1 || !await recipient.isVisible() || await send.count() !== 1) {
+    if (await dialogs.count() !== 1 || !await sameTarget(true) || await send.count() !== 1) {
       throw new TargetProfileMismatchError("Invitation recipient or controls changed before Send; stop.");
     }
     await fence();
-    if (await dialogs.count() !== 1 || await recipient.count() !== 1 || !await recipient.isVisible()
+    if (await dialogs.count() !== 1 || !await sameTarget(true)
         || await send.count() !== 1 || !await send.isVisible() || !await send.isEnabled()) {
       throw new TargetProfileMismatchError("Invitation recipient or controls changed during eligibility check; stop.");
     }
