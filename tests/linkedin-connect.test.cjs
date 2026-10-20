@@ -25,6 +25,9 @@ beforeEach(async()=>{
   const url=route.request().url();state.visits.push(url);
   if(!route.request().isNavigationRequest())return route.abort();
   if(state.redirect&&url===target)return route.fulfill({status:200,contentType:'text/html',body:'<script>history.replaceState(null,"","/authwall")</script><main><h1>Join LinkedIn</h1></main>'});
+  if(url.includes('/mynetwork/invitation-manager/sent'))return state.sentMissing
+   ?route.fulfill({status:404,contentType:'text/html',body:'<main>Not found</main>'})
+   :route.fulfill({status:200,contentType:'text/html',body:'<main>'+(state.sentList||[]).map(slug=>'<section><a href="/in/'+slug+'/">'+slug+'</a><button onclick="window.fixtureClicked()">Withdraw</button></section>').join('')+'</main>'});
   const markup=url.includes('custom-invite')&&!state.noDialogPage?dialog():profile();
   return route.fulfill({status:state.blockAfterSend&&state.sends?999:200,contentType:'text/html',body:markup+`<script>
 window.dialogHtml=${JSON.stringify(dialog())};
@@ -199,5 +202,28 @@ test('Echo dialog that never names the approved recipient cannot add a note',asy
  state.noteEditor=true;state.realNoteView=true;state.wrongDialog=true;let calls=0;
  await assert.rejects(api.sendConnectionRequest(page,target,()=>calls++,approved),api.TargetProfileMismatchError);
  assert.equal(calls,0);assert.equal(state.sends,0);
+});
+
+const sentUrl='https://www.linkedin.com/mynetwork/invitation-manager/sent/';
+test('Echo send whose profile shows no Pending is confirmed by the exact member at the top of Sent, read-only',async()=>{
+ state.noteEditor=true;state.realNoteView=true;state.unknown=true;state.sentList=['target-fixture','other-fixture'];let calls=0;
+ await api.sendConnectionRequest(page,target,()=>{calls++},approved);
+ assert.equal(calls,1);assert.equal(state.sends,1);assert.equal(state.clicks,0);
+ assert.ok(state.visits.includes(sentUrl));
+});
+test('Echo Sent list without the exact member (even a longer slug) stays unknown',async()=>{
+ state.noteEditor=true;state.unknown=true;state.sentList=['target-fixture-2','other-fixture'];
+ await assert.rejects(api.sendConnectionRequest(page,target,()=>{},approved),e=>e instanceof api.InvitationOutcomeUnknownError&&e.sendAttempted);
+ assert.equal(state.sends,1);assert.equal(state.clicks,0);
+});
+test('Echo missing Sent page stays unknown',async()=>{
+ state.noteEditor=true;state.unknown=true;state.sentMissing=true;
+ await assert.rejects(api.sendConnectionRequest(page,target,()=>{},approved),e=>e instanceof api.InvitationOutcomeUnknownError&&e.sendAttempted);
+ assert.equal(state.sends,1);
+});
+test('non-Echo invitations never use the Sent fallback',async()=>{
+ state.unknown=true;state.sentList=['target-fixture'];
+ await assert.rejects(api.sendConnectionRequest(page,target),e=>e instanceof api.InvitationOutcomeUnknownError&&e.sendAttempted);
+ assert.ok(!state.visits.includes(sentUrl));
 });
 

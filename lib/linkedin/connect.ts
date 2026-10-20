@@ -121,6 +121,34 @@ async function observeRendering(page: Page, ready: () => Promise<boolean>): Prom
   return false;
 }
 
+export const SENT_INVITATIONS_URL = "https://www.linkedin.com/mynetwork/invitation-manager/sent/";
+
+function linksExactProfile(href: string, slug: string): boolean {
+  try {
+    const url = new URL(href, "https://www.linkedin.com");
+    if (url.protocol !== "https:" || !["www.linkedin.com", "linkedin.com"].includes(url.hostname)) return false;
+    const match = url.pathname.match(/^\/in\/([^/]+)\/?$/);
+    return Boolean(match) && decodeURIComponent(match![1]).toLowerCase() === slug.toLowerCase();
+  } catch { return false; }
+}
+
+/** Read-only second confirmation for an Echo invitation whose profile card did
+ * not show Pending. LinkedIn lists sent invitations newest first, so the exact
+ * member must be linked among the first entries of its Sent page. Navigation
+ * only: no click, scroll, retry or provider write. Any doubt is "not confirmed". */
+async function sentListConfirms(page: Page, slug: string): Promise<boolean> {
+  try {
+    const response = await page.goto(SENT_INVITATIONS_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+    if (!response || response.status() >= 400) return false;
+    if (new URL(page.url()).pathname.replace(/\/$/, "") !== "/mynetwork/invitation-manager/sent") return false;
+    return await observeRendering(page, async () => {
+      const hrefs = await page.locator("main a[href*='/in/']").evaluateAll(links =>
+        links.slice(0, 40).map(link => link.getAttribute("href") || ""));
+      return hrefs.some(href => linksExactProfile(href, slug));
+    });
+  } catch { return false; }
+}
+
 async function isPending(card: Locator): Promise<boolean> {
   return /\bPending\b/.test(await card.innerText()) ||
     await card.getByRole("button", { name: /Pending/ }).count() > 0;
@@ -271,13 +299,25 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     if (!closed) throw new InvitationOutcomeUnknownError(true);
 
     // One normal read-only post-action check. Absence of a toast/dialog is not success.
-    const observed = await page.goto(linkedinUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    if (!observed || observed.status() >= 400) throw new InvitationOutcomeUnknownError(true);
-    const observedCard = await exactProfileCard(page, slug, approved?.fullName || fullName);
-    if (!await observeRendering(page, async () => {
-      if (profileSlug(page.url()) !== slug) throw new TargetProfileMismatchError("Post-send profile changed; stop.");
-      return await isPending(observedCard);
-    })) throw new InvitationOutcomeUnknownError(true);
+    let confirmed = false;
+    try {
+      const observed = await page.goto(linkedinUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      if (observed && observed.status() < 400) {
+        const observedCard = await exactProfileCard(page, slug, approved?.fullName || fullName);
+        confirmed = await observeRendering(page, async () => {
+          if (profileSlug(page.url()) !== slug) throw new TargetProfileMismatchError("Post-send profile changed; stop.");
+          return await isPending(observedCard);
+        });
+      }
+    } catch (error) {
+      // Non-Echo behavior is unchanged: any post-send doubt is an unknown outcome.
+      if (!approved) throw error;
+    }
+    // Echo only: when the profile did not show Pending (a layout can keep it in a
+    // menu, or render it late), one read-only look at the top of LinkedIn's Sent
+    // list for the exact member, before holding the person as unknown.
+    if (!confirmed && approved) confirmed = await sentListConfirms(page, slug);
+    if (!confirmed) throw new InvitationOutcomeUnknownError(true);
   } catch (error) {
     if (approved && !sendAttempted && error instanceof TargetProfileMismatchError) await captureInviteDiagnostic(page, approved.fullName);
     if (error instanceof WeeklyLimitError || error instanceof AlreadyConnectedError || error instanceof PendingInviteError || error instanceof InvitationOutcomeUnknownError) throw error;

@@ -167,6 +167,47 @@ interface Template { id: string; body: string; }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
+// ─── daily budget accounting ─────────────────────────────────────────────────
+
+/** Connection requests already spent today on this account. An Echo-managed
+ * invitation ends with "Echo initial connection confirmed" (also when an owner
+ * reconciled it) instead of "Connection request sent", and spends the same
+ * LinkedIn budget. */
+export function connectsSentTodayCount(db: ReturnType<typeof getDb>, accountId: string): number {
+  return (db.prepare(
+    `SELECT COUNT(*) as c FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
+     AND (message LIKE 'Connection request sent%' OR message LIKE 'Echo initial connection confirmed%')
+     AND date(created_at) = date('now')`
+  ).get(accountId) as { c: number }).c;
+}
+
+/** A workflow's first LinkedIn step that spends a daily budget. Visits and
+ * delays only prepare it, so visit -> connect draws on the connection budget
+ * exactly like connect -> message. */
+export function firstActionStepType(db: ReturnType<typeof getDb>, workflowId: string): string | undefined {
+  const row = db.prepare(
+    `SELECT step_type FROM workflow_steps WHERE workflow_id = ? AND track = 'linkedin'
+     AND step_type NOT IN ('visit', 'delay') ORDER BY step_order LIMIT 1`
+  ).get(workflowId) as { step_type: string } | undefined;
+  return row?.step_type;
+}
+
+/** In-progress LinkedIn tracks due today whose workflow's first spending step is
+ * `stepType`; each will use one of today's slots of that kind. */
+export function scheduledFirstActionsToday(db: ReturnType<typeof getDb>, accountId: string, stepType: "connect" | "sales_inmail"): number {
+  return (db.prepare(
+    `SELECT COUNT(*) as c FROM run_profile_tracks rt
+     JOIN run_profiles rp ON rp.id = rt.run_profile_id
+     JOIN runs r ON r.id = rp.run_id
+     JOIN workflow_steps ws ON ws.workflow_id = r.workflow_id AND ws.track = 'linkedin'
+       AND ws.step_order = (SELECT MIN(w2.step_order) FROM workflow_steps w2
+         WHERE w2.workflow_id = r.workflow_id AND w2.track = 'linkedin' AND w2.step_type NOT IN ('visit', 'delay'))
+     WHERE r.account_id = ? AND rt.track = 'linkedin' AND rt.state = 'in_progress'
+     AND ws.step_type = ?
+     AND date(datetime(rt.next_step_at)) = date('now')`
+  ).get(accountId, stepType) as { c: number }).c;
+}
+
 function log(db: ReturnType<typeof getDb>, runId: string, targetId: string | null, level: "info" | "warn" | "error", message: string) {
   db.prepare("INSERT INTO logs (id, run_id, target_id, level, message) VALUES (?, ?, ?, ?, ?)").run(randomUUID(), runId, targetId, level, message);
   console.log(`[runner] [${level}] run=${runId} target=${targetId ?? "-"} ${message}`);
@@ -1164,10 +1205,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
   const messagesSentToday = new Map<string, number>();
   const inmailsSentToday = new Map<string, number>();
   for (const [accountId] of accountLimitsMap) {
-    const c = (db.prepare(
-      `SELECT COUNT(*) as c FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
-       AND message LIKE 'Connection request sent%' AND date(created_at) = date('now')`
-    ).get(accountId) as { c: number }).c;
+    const c = connectsSentTodayCount(db, accountId);
     const m = (db.prepare(
       `SELECT COUNT(*) as c FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
        AND message LIKE 'Message sent%' AND date(created_at) = date('now')`
@@ -1241,19 +1279,17 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
   ).all(...runIds) as TrackRun[];
 
   // Enroll new pending track-runs — track remaining slots per account across runs.
-  // Enrollment (pending -> in_progress) happens exactly once per track-run, on its
-  // FIRST linkedin-track step, so the budget it draws from must match that step's
-  // type — a workflow can open on "connect" (e.g. connect -> message) or on
-  // "sales_inmail" (e.g. an InMail-first campaign), and each type has its own daily cap.
+  // Enrollment (pending -> in_progress) happens exactly once per track-run, and the
+  // budget it draws from must match the workflow's first SPENDING step: a workflow
+  // can open on "connect" (connect -> message), on "sales_inmail" (an InMail-first
+  // campaign), or prepare with a visit first (Echo's visit -> connect); visits and
+  // delays spend nothing. Each type has its own daily cap.
   const connectSlotsRemaining = new Map<string, number>();
   const inmailSlotsRemaining = new Map<string, number>();
   const firstLinkedinStepCache = new Map<string, string | undefined>();
   const getFirstLinkedinStepType = (workflowId: string): string | undefined => {
     if (!firstLinkedinStepCache.has(workflowId)) {
-      const row = db.prepare(
-        "SELECT step_type FROM workflow_steps WHERE workflow_id = ? AND track = 'linkedin' ORDER BY step_order LIMIT 1"
-      ).get(workflowId) as { step_type: string } | undefined;
-      firstLinkedinStepCache.set(workflowId, row?.step_type);
+      firstLinkedinStepCache.set(workflowId, firstActionStepType(db, workflowId));
     }
     return firstLinkedinStepCache.get(workflowId);
   };
@@ -1272,16 +1308,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
         ? (inmailsSentToday.get(run.account_id) ?? 0)
         : (connectsSentToday.get(run.account_id) ?? 0);
       const actionsLeft = Math.max(0, dailyLimit - sentToday);
-      const firstStepTypeSql = isInmailFirst ? "'sales_inmail'" : "'connect'";
-      const scheduledToday = (db.prepare(
-        `SELECT COUNT(*) as c FROM run_profile_tracks rt
-         JOIN run_profiles rp ON rp.id = rt.run_profile_id
-         JOIN runs r ON r.id = rp.run_id
-         JOIN workflow_steps ws ON ws.workflow_id = r.workflow_id AND ws.track = 'linkedin' AND ws.step_order = 1
-         WHERE r.account_id = ? AND rt.track = 'linkedin' AND rt.state = 'in_progress'
-         AND ws.step_type = ${firstStepTypeSql}
-         AND date(datetime(rt.next_step_at)) = date('now')`
-      ).get(run.account_id) as { c: number }).c;
+      const scheduledToday = scheduledFirstActionsToday(db, run.account_id, isInmailFirst ? "sales_inmail" : "connect");
       slotsRemaining.set(run.account_id, Math.max(0, actionsLeft - scheduledToday));
     }
     const slotsLeft = slotsRemaining.get(run.account_id)!;
