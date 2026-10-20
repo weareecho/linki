@@ -99,3 +99,10 @@ test('cleared editable notes do not bypass durable Echo origin',async()=>{
 test('unscoped Echo workflow is held before provider access',async()=>{
  db.prepare('UPDATE workflows SET name=?').run('Echo outreach');db.prepare('UPDATE targets SET notes=NULL').run();await execute();assert.equal(actions,0);assert.equal(pages,0);assert.equal(db.prepare('SELECT status FROM runs').get().status,'paused');
 });
+
+test('guard waits long enough for the bridge production DB checks, still one request',async()=>{
+ assert.equal(guard.ECHO_GUARD_TIMEOUT_MS,30000);
+ let calls=0,signal=null;
+ await assert.rejects(guard.assertEchoEligible(scope(),'check',async(url,options)=>{calls++;signal=options.signal;throw new Error('Synthetic abort')}),guard.EchoEligibilityError);
+ assert.equal(calls,1);assert.ok(signal&&typeof signal.aborted==='boolean');
+});
