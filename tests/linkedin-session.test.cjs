@@ -151,3 +151,19 @@ test('LinkedIn documented www domain cookie is accepted without admitting foreig
  const legacy={cookies:[{...valid().cookies[0],domain:'.www.linkedin.com',expires:undefined}],origins:[]};
  assert.equal(guard.hasUsableLinkedInState(guard.normalizeLegacyLinkedInState(legacy)),true);
 });
+
+test('readiness page opener uses only the EXISTING context, never creates one, and is registered by the owner',async()=>{
+ f.ctx.browser=()=>f.browser;
+ await assert.rejects(api.getExistingContextPage('fixture',f.ctx),{name:'LinkedInSessionUnavailableError'});
+ assert.equal(f.contexts,0,'no context is created for readiness');
+ const ctx=await api.getSessionContext('fixture');assert.equal(f.contexts,1);
+ const page=await api.getExistingContextPage('fixture',ctx);
+ assert.equal(page,f.page);assert.equal(f.contexts,1);assert.equal(f.navigations.length,0);await page.close();
+ await assert.rejects(api.getExistingContextPage('fixture',{...ctx,browser:()=>f.browser}),{name:'LinkedInSessionUnavailableError'});
+ const readiness=await import(pathToFileURL(path.join(root,'lib/linkedin/readiness-session.ts')).href);
+ assert.equal(globalThis.__linkiExistingPageOpener,api.getExistingContextPage);
+ assert.equal(readiness.existingContexts.get('fixture'),ctx);
+ f.browser.isConnected=()=>false;
+ await assert.rejects(api.getExistingContextPage('fixture',ctx),{name:'LinkedInSessionUnavailableError'});
+ f.browser.isConnected=()=>true;
+});

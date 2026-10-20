@@ -5,7 +5,7 @@ import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
 import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, isLinkedInLoginLanding, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
 import { captureLoginDiagnostic } from "@/lib/linkedin/session-diagnostic";
-import { existingContexts } from "@/lib/linkedin/readiness-session";
+import { existingContexts, registerExistingPageOpener } from "@/lib/linkedin/readiness-session";
 
 chromium.use(StealthPlugin());
 
@@ -117,8 +117,8 @@ const PAGE_TEARDOWN_GAP_MS = 3000;
 const PAGE_MAX_HOLD_MS = 120_000;
 let pageQueueTail: Promise<void> = Promise.resolve();
 
-/** Returns a new Page from the account's browser context */
-export async function getSessionPage(accountId: string): Promise<Page> {
+/** Opens a page during this caller's turn in the app-wide page queue. */
+async function openQueuedPage(open: () => Promise<Page>): Promise<Page> {
   let releaseTurn!: () => void;
   const myTurn = new Promise<void>(r => { releaseTurn = r; });
   const previousTail = pageQueueTail;
@@ -135,17 +135,7 @@ export async function getSessionPage(accountId: string): Promise<Page> {
 
   let page: Page;
   try {
-    const ctx = await getOrCreateContext(accountId);
-    try {
-      page = await ctx.newPage();
-    } catch {
-      // B2: context was dead — CLOSE it before recreating so its underlying
-      // browser process isn't left orphaned, then retry once with a fresh one.
-      try { await ctx.close(); } catch { /* already gone */ }
-      contexts.delete(accountId);
-      const freshCtx = await getOrCreateContext(accountId);
-      page = await freshCtx.newPage();
-    }
+    page = await open();
   } catch (err) {
     clearTimeout(safetyTimer);
     release();
@@ -164,6 +154,35 @@ export async function getSessionPage(accountId: string): Promise<Page> {
 
   return page;
 }
+
+/** Returns a new Page from the account's browser context */
+export async function getSessionPage(accountId: string): Promise<Page> {
+  return openQueuedPage(async () => {
+    const ctx = await getOrCreateContext(accountId);
+    try {
+      return await ctx.newPage();
+    } catch {
+      // B2: context was dead — CLOSE it before recreating so its underlying
+      // browser process isn't left orphaned, then retry once with a fresh one.
+      try { await ctx.close(); } catch { /* already gone */ }
+      contexts.delete(accountId);
+      const freshCtx = await getOrCreateContext(accountId);
+      return freshCtx.newPage();
+    }
+  });
+}
+
+/** Readiness only: a page in the account's EXISTING context, in the same queue.
+ * Never launches a browser, creates/recreates a context or retries. */
+export async function getExistingContextPage(accountId: string, context: BrowserContext): Promise<Page> {
+  return openQueuedPage(async () => {
+    if (contexts.get(accountId) !== context || !context.browser()?.isConnected()) {
+      throw new LinkedInSessionUnavailableError();
+    }
+    return context.newPage();
+  });
+}
+registerExistingPageOpener(getExistingContextPage);
 
 export async function saveSessionState(accountId: string): Promise<void> {
   const ctx = contexts.get(accountId);

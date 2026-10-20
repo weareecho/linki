@@ -191,30 +191,68 @@ test('artifact requires actual executor and loaded guard registration, cleared o
   l.context.__linkiReadinessExecutor.revision='sha256:'+'f'.repeat(64);assert.equal(a.runningGuardRevision(),null);
   const unbuilt=loader().load('lib/linkedin/readiness-artifact.ts');unbuilt.recordExecutorStarted('');assert.equal(unbuilt.runningGuardRevision(),null);
 });
-const ownFeed='<nav><img class="global-nav__me-photo"></nav><aside><a data-control-name="identity_profile_photo" href="/in/fixture-owner/">Owner</a></aside>';
-test('feed parser requires own identity and signed-in navigation, ignores scripts/comments/templates',()=>{
+const ownIdentity=JSON.stringify({plainId:1,miniProfile:{publicIdentifier:'fixture-owner',entityUrn:'urn:li:fs_miniProfile:ACoFixture'},premiumSubscriber:false});
+test('own identity parser accepts only the top-level miniProfile of a bounded JSON object',()=>{
   const s=loader().load('lib/linkedin/readiness-session.ts');
-  assert.equal(s.profileFromOwnFeed(ownFeed),profile);
-  for(const html of ['<a href="/in/prospect">prospect</a>', '<!--'+ownFeed+'-->', '<script>'+ownFeed+'</script>',
-    '<template>'+ownFeed+'</template>',ownFeed+ownFeed,ownFeed.replace('identity_profile_photo','post_author_photo')])
-    assert.equal(s.profileFromOwnFeed(html),null);
+  assert.equal(s.profileFromOwnIdentity(ownIdentity),profile);
+  const mini=(extra)=>JSON.stringify({miniProfile:{publicIdentifier:'fixture-owner',entityUrn:'urn:li:fs_miniProfile:x',...extra}});
+  for(const raw of ['', 'not json', '[]', 'null', JSON.stringify({publicIdentifier:'fixture-owner'}),
+    JSON.stringify({data:{miniProfile:{publicIdentifier:'fixture-owner',entityUrn:'urn:li:fs_miniProfile:x'}}}),
+    mini({publicIdentifier:'prospect/../x'}),mini({publicIdentifier:''}),mini({publicIdentifier:7}),mini({entityUrn:'urn:li:member:1'}),
+    JSON.stringify({miniProfile:{publicIdentifier:'fixture-owner'}}),' '.repeat(64*1024)+ownIdentity])
+    assert.equal(s.profileFromOwnIdentity(raw),null,raw.slice(0,60));
 });
-test('existing-session observation performs only one fixed authenticated own-feed GET, no page or cookie access',async()=>{
+// Execute the serialized in-page function the way Playwright does: from its source,
+// against a stubbed document and browser fetch. No network.
+function runInPage(fn,limit,{cookie='JSESSIONID="ajax:123"; li_at=x',respond}){
+  const calls=[];
+  const sandbox={document:{cookie},AbortController,setTimeout,clearTimeout,
+    fetch:async(url,options)=>{calls.push({url,options});return respond(url,options)}};
+  return {calls,result:vm.runInNewContext('('+fn.toString()+')('+JSON.stringify(limit)+')',sandbox)};
+}
+const meResponse=(over={})=>({status:200,url:'https://www.linkedin.com/voyager/api/me',
+  headers:{get:k=>k==='content-type'?'application/json; charset=utf-8':null},text:async()=>ownIdentity,...over});
+test('in-page own identity request is first-party, credentialed, redirect-free and bounded',async()=>{
+  const s=loader().load('lib/linkedin/readiness-session.ts');
+  const ok=runInPage(s.ownIdentityInPage,65536,{respond:()=>meResponse()});
+  assert.equal(await ok.result,ownIdentity);
+  assert.equal(ok.calls.length,1);const {url,options}=ok.calls[0];
+  assert.equal(url,'/voyager/api/me');assert.equal(options.method,'GET');assert.equal(options.credentials,'include');
+  assert.equal(options.redirect,'error');assert.equal(options.cache,'no-store');assert.ok(options.signal);
+  assert.equal(options.headers['csrf-token'],'ajax:123');assert.equal(options.headers.accept,'application/json');
+  for(const over of [{status:302},{status:401},{url:'https://www.linkedin.com/uas/login'},
+    {headers:{get:()=> 'text/html'}},{text:async()=>'x'.repeat(65537)}])
+    assert.equal(await runInPage(s.ownIdentityInPage,65536,{respond:()=>meResponse(over)}).result,null,JSON.stringify(Object.keys(over)));
+  assert.equal(await runInPage(s.ownIdentityInPage,65536,{respond:()=>{throw new TypeError('redirect')}}).result,null);
+  const noCsrf=runInPage(s.ownIdentityInPage,65536,{cookie:'li_at=x',respond:()=>meResponse()});
+  assert.equal(await noCsrf.result,null);assert.equal(noCsrf.calls.length,0);
+});
+test('existing-session observation opens one queued page in the EXISTING context only, never a context or Node request',async()=>{
   const s=loader().load('lib/linkedin/readiness-session.ts');
   assert.equal(await s.observeExistingIdentity(scope.account_id),null);
-  let status=200,html=ownFeed,disposed=0,calls=0;
-  const context={browser:()=>({isConnected:()=>true}),request:{get:async(url,options)=>{
-    calls++;assert.equal(url,'https://www.linkedin.com/feed/');assert.equal(options.maxRedirects,0);
-    assert.equal(options.maxRetries,0);assert.equal(options.timeout,4000);
-    assert.equal(options.headers['cache-control'],'no-cache, no-store');
-    return {status:()=>status,url:()=>url,headers:()=>({'content-type':'text/html'}),body:async()=>Buffer.from(html),dispose:async()=>{disposed++}};
-  }}};
+  let connected=true,status=200,landed=s.OWN_IDENTITY_ORIGIN_URL,inPage=ownIdentity,opened=0,closed=0,gotos=[];
+  const context={browser:()=>({isConnected:()=>connected}),
+    request:{get:async()=>{throw Error('Node-side LinkedIn request forbidden')}},newPage:async()=>{throw Error('direct page forbidden')}};
   s.existingContexts.set(scope.account_id,context);
-  const observation=await s.observeExistingIdentity(scope.account_id);assert.equal(observation.profile,profile);assert.equal(observation.isCurrent(),true);
+  assert.equal(await s.observeExistingIdentity(scope.account_id),null,'no registered owner opener');
+  s.registerExistingPageOpener(async(account,ctx)=>{
+    assert.equal(account,scope.account_id);assert.equal(ctx,context);opened++;
+    return {goto:async(url,options)=>{gotos.push({url,options});return {status:()=>status}},url:()=>landed,
+      evaluate:async(fn,limit)=>{assert.equal(fn,s.ownIdentityInPage);assert.equal(limit,65536);return inPage},
+      close:async()=>{closed++}};
+  });
+  const observation=await s.observeExistingIdentity(scope.account_id);
+  assert.equal(observation.profile,profile);assert.equal(observation.isCurrent(),true);
+  assert.ok(observation.startedAt<=observation.observedAt);
+  assert.deepEqual(plain(gotos[0]),{url:'https://www.linkedin.com/robots.txt',options:{waitUntil:'domcontentloaded',timeout:3000}});
   status=302;assert.equal(await s.observeExistingIdentity(scope.account_id),null);
-  status=200;html='<html>Guest</html>';assert.equal(await s.observeExistingIdentity(scope.account_id),null);
-  assert.equal(calls,3);assert.equal(disposed,3);
-  s.existingContexts.delete(scope.account_id);assert.equal(observation.isCurrent(),false);
+  status=200;landed='https://www.linkedin.com/authwall';assert.equal(await s.observeExistingIdentity(scope.account_id),null);
+  landed=s.OWN_IDENTITY_ORIGIN_URL;inPage=null;assert.equal(await s.observeExistingIdentity(scope.account_id),null);
+  inPage=JSON.stringify({miniProfile:{publicIdentifier:'someone-else',entityUrn:'urn:li:fs_miniProfile:y'}});
+  assert.equal((await s.observeExistingIdentity(scope.account_id)).profile,'https://www.linkedin.com/in/someone-else');
+  connected=false;assert.equal(await s.observeExistingIdentity(scope.account_id),null);
+  assert.equal(opened,closed,'every opened page is closed');
+  connected=true;s.existingContexts.delete(scope.account_id);assert.equal(observation.isCurrent(),false);
 });
 function request(body,{secret='fixture-secret',method='POST',type='application/json'}={}) {
   const req=Readable.from([Buffer.from(typeof body==='string'?body:JSON.stringify(body))]);
@@ -256,10 +294,14 @@ test('actual build source digest → loaded guard → existing paused executor �
   assert.equal(artifact.runningGuardRevision(),builtRevision);
   assert.equal(l.load('lib/linkedin/echo-guard.ts').ECHO_GUARD_ARTIFACT_REVISION,builtRevision);
   const session=l.load('lib/linkedin/readiness-session.ts');let ownGets=0,bridgeCalls=0;
-  session.existingContexts.set(scope.account_id,{browser:()=>({isConnected:()=>true}),request:{get:async(url)=>{
-    ownGets++;assert.equal(url,'https://www.linkedin.com/feed/');return {status:()=>200,url:()=>url,
-      headers:()=>({'content-type':'text/html'}),body:async()=>Buffer.from(ownFeed),dispose:async()=>{}};
-  }}});
+  const owned={browser:()=>({isConnected:()=>true}),request:{get:forbid},newPage:forbid};
+  session.existingContexts.set(scope.account_id,owned);
+  session.registerExistingPageOpener(async(account,ctx)=>{
+    assert.equal(ctx,owned);
+    return {goto:async(url)=>{assert.equal(url,session.OWN_IDENTITY_ORIGIN_URL);return {status:()=>200}},
+      url:()=>session.OWN_IDENTITY_ORIGIN_URL,evaluate:async(fn)=>{ownGets++;assert.equal(fn,session.ownIdentityInPage);return ownIdentity},
+      close:async()=>{}};
+  });
   const db=fixtureDatabase(),api=l.load('lib/linkedin/readiness.ts'),store=l.load('lib/linkedin/readiness-store.ts');
   const digest=api.canonicalManifestDigest(rawManifest);
   const expected={...scope,guard_revision:builtRevision,approval_manifest_digest:digest,challenge:'f'.repeat(64)};
