@@ -28,7 +28,7 @@ beforeEach(async()=>{
   const markup=url.includes('custom-invite')&&!state.noDialogPage?dialog():profile();
   return route.fulfill({status:state.blockAfterSend&&state.sends?999:200,contentType:'text/html',body:markup+`<script>
 window.dialogHtml=${JSON.stringify(dialog())};
-window.activateNote=(button)=>{button.hidden=true;document.querySelector("#fixture-note").hidden=false;document.querySelector("[data-fixture-send]").textContent="Send"};
+window.activateNote=(button)=>{button.hidden=true;document.querySelector("#fixture-note").hidden=false;const send=document.querySelector("[data-fixture-send]");send.textContent="Send";${state.realNoteView?'document.querySelector("#fixture-recipient").remove();send.setAttribute("aria-label","Send invitation");':''}${state.urlDrift?'history.replaceState(null,"","/preload/custom-invite/?vanityName=other-fixture");':''}};
 window.finishDialog=()=>{
  setTimeout(()=>{const p=document.querySelector('#fixture-recipient');if(p)p.textContent=${JSON.stringify(state.wrongDialog?'Other Fixture':'Target Fixture')}},${state.recipientDelay||0});
  setTimeout(()=>{const b=document.querySelector('[data-fixture-send]');if(b)b.hidden=false},${state.sendDelay||0});
@@ -179,3 +179,25 @@ test('Echo note changed during awaited eligibility check cannot send',async()=>{
 test('modern H2 card supports the exact named recipient and positive Pending confirmation',async()=>{state.modernHeading=true;await api.sendConnectionRequest(page,target,undefined,undefined,'Target Fixture');assert.equal(state.sends,1)});
 test('modern already-connected card never sends another invitation',async()=>{state.modernHeading=true;state.connected=true;await assert.rejects(api.sendConnectionRequest(page,target,undefined,undefined,'Target Fixture'),api.AlreadyConnectedError);assert.equal(state.sends,0)});
 test('modern card with a different recipient name is refused',async()=>{state.modernHeading=true;await assert.rejects(api.sendConnectionRequest(page,target,undefined,undefined,'Other Fixture'),api.TargetProfileMismatchError);assert.equal(state.sends,0)});
+
+test('Echo real note view (name removed, "Send invitation" control) sends once after the name was verified',async()=>{
+ state.noteEditor=true;state.realNoteView=true;let calls=0;
+ await api.sendConnectionRequest(page,target,()=>{calls++;assert.equal(state.sends,0)},approved);
+ assert.equal(calls,1);assert.equal(state.sends,1);assert.equal(state.pending,true);
+});
+test('Echo real note view on a button layout: invite page, verified name, note, one send',async()=>{
+ state.connectButton=true;state.noteEditor=true;state.realNoteView=true;let calls=0;
+ await api.sendConnectionRequest(page,target,()=>{calls++},approved);
+ assert.equal(state.clicks,0);assert.equal(calls,1);assert.equal(state.sends,1);
+});
+test('Echo note view that leaves the exact target invitation page cannot send',async()=>{
+ state.noteEditor=true;state.realNoteView=true;state.urlDrift=true;let calls=0;
+ await assert.rejects(api.sendConnectionRequest(page,target,()=>calls++,approved),api.TargetProfileMismatchError);
+ assert.equal(calls,0);assert.equal(state.sends,0);
+});
+test('Echo dialog that never names the approved recipient cannot add a note',async()=>{
+ state.noteEditor=true;state.realNoteView=true;state.wrongDialog=true;let calls=0;
+ await assert.rejects(api.sendConnectionRequest(page,target,()=>calls++,approved),api.TargetProfileMismatchError);
+ assert.equal(calls,0);assert.equal(state.sends,0);
+});
+
