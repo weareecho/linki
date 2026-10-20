@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
-import { getSessionPage, saveSessionState } from "@/lib/linkedin/session";
+import { getSessionPage, saveSessionState, savedLoginExpiresAt } from "@/lib/linkedin/session";
 import { scrapeLinkedInStats } from "@/lib/linkedin/li-stats";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -26,7 +26,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         li_stats_synced_at = datetime('now')
       WHERE id = ?
     `).run(stats.connections, stats.pending, stats.profile_views, accountId);
-    return res.json(stats);
+    return res.json({ ...stats, login_expires_at: savedLoginExpiresAt(accountId) });
   } catch (err) {
     console.error("[li-stats]", err);
     return res.status(500).json({ error: err instanceof Error ? err.message : "Scrape failed" });

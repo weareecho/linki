@@ -35,6 +35,43 @@ export function createImportedLinkedInState(liAt: string, documentCookie = ""): 
   return { cookies: [{ name: "li_at", value: liAt.trim(), domain: ".linkedin.com", path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "None" }, ...extras], origins: [] };
 }
 
+/** A LinkedIn page served instead of the requested one to a visitor who is not
+ * signed in: sign-in, guest wall, sign-up or security check. Reaching one does
+ * not by itself prove the saved login is gone; confirmSignedIn decides that. */
+export class LinkedInSignedOutError extends Error {
+  constructor() {
+    super("LinkedIn showed a sign-in page instead of the requested page.");
+    this.name = "LinkedInSignedOutError";
+  }
+}
+
+const SIGN_IN_WALLS = ["/login", "/authwall", "/checkpoint", "/uas", "/signup"];
+
+export function isSignInWall(url: string): boolean {
+  try {
+    const value = new URL(url);
+    if (!["www.linkedin.com", "linkedin.com"].includes(value.hostname)) return false;
+    return SIGN_IN_WALLS.some(prefix => value.pathname === prefix || value.pathname.startsWith(prefix + "/"));
+  } catch { return false; }
+}
+
+/** Whether a page that a step just used shows LinkedIn's signed-out state: a
+ * sign-in page, or a context whose login cookie LinkedIn has just removed (its
+ * guest view keeps the requested URL). False when the page cannot be read. */
+export async function pageIsSignedOut(page: Page): Promise<boolean> {
+  try {
+    return isSignInWall(page.url()) || !hasUsableLinkedInState(await page.context().storageState());
+  } catch { return false; }
+}
+
+/** When the saved login cookie lapses (unix seconds); -1 for a browser-session
+ * cookie and null when there is none. A date only, never the cookie. */
+export function savedLoginExpiry(state: unknown, nowSeconds = Date.now() / 1000): number | null {
+  if (!hasUsableLinkedInState(state, nowSeconds)) return null;
+  const usable = state.cookies.filter(cookie => hasUsableLinkedInState({ cookies: [cookie], origins: [] }, nowSeconds));
+  return usable.some(cookie => cookie.expires === -1) ? -1 : Math.max(...usable.map(cookie => cookie.expires));
+}
+
 // This proves usable saved credentials, not live access or the account's identity.
 export function hasUsableLinkedInState(state: unknown, nowSeconds = Date.now() / 1000): state is LinkedInStorageState {
   if (!state || typeof state !== "object") return false;
@@ -114,7 +151,7 @@ export function hasAccountNavigation(hrefs: string[]): boolean {
 export function loginLocation(url: string): string {
   try {
     const path = new URL(url).pathname;
-    for (const prefix of ["/feed", "/sales", "/checkpoint", "/authwall", "/login"]) {
+    for (const prefix of ["/feed", "/sales", "/checkpoint", "/authwall", "/login", "/uas", "/signup"]) {
       if (path === prefix || path.startsWith(prefix + "/")) return prefix;
     }
   } catch { /* no URL details */ }

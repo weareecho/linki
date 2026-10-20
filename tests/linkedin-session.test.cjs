@@ -20,14 +20,14 @@ let api,guard,f;
 const realNow=Date.now;
 const valid=()=>({cookies:[{name:'li_at',value:'synthetic-fixture-only',domain:'.linkedin.com',path:'/',expires:Date.now()/1000+3600}],origins:[]});
 beforeEach(async()=>{
- f=globalThis.sessionFixture={state:valid(),stored:JSON.stringify(valid()),visibleNav:true,url:'https://www.linkedin.com/feed/',writes:[],navigations:[],contexts:0,elapsed:0,navChecks:0};
+ f=globalThis.sessionFixture={state:valid(),stored:JSON.stringify(valid()),visibleNav:true,url:'https://www.linkedin.com/feed/',writes:[],sql:[],navigations:[],contexts:0,elapsed:0,navChecks:0};
  Date.now=()=>realNow()+f.elapsed;
  const locator={first(){return this},async count(){return 0},async evaluateAll(){return []},async waitFor(){},async fill(){},async press(){},async isVisible(){f.navChecks++;return f.navAfter===undefined?f.visibleNav:f.navChecks>=f.navAfter}};
- f.page={url:()=>f.url,context:()=>f.ctx,locator:()=>locator,getByText:()=>({async count(){return 0},filter(){return this},first(){return this},async isVisible(){return false}}),async goto(url){f.navigations.push(url)},async waitForLoadState(){},async waitForURL(predicate){if(!predicate(new URL(f.url)))throw Error("fixture wait timeout")},async waitForTimeout(ms){f.elapsed+=ms;if(f.afterWait)f.afterWait()},async close(){}};
+ f.page={url:()=>f.url,context:()=>f.ctx,locator:()=>locator,getByText:()=>({async count(){return 0},filter(){return this},first(){return this},async isVisible(){return false}}),async goto(url){f.navigations.push(url)},async waitForLoadState(){},async waitForURL(predicate){if(!predicate(new URL(f.url)))throw Error("fixture wait timeout")},async waitForTimeout(ms){f.elapsed+=ms;if(f.afterWait)f.afterWait()},async evaluate(){return f.identity??null},async close(){}};
  f.page.frames=()=>[f.page];f.page.mainFrame=()=>f.page;
  f.ctx={storageState:async()=>f.state,newPage:async()=>f.page,on(){},async close(){}};
  f.browser={isConnected:()=>true,async newContext(){globalThis.sessionFixture.contexts++;return globalThis.sessionFixture.ctx},async close(){}};
- f.db={prepare(){return {get:()=>({email:'owner@example.test',cookies_json:f.stored}),run:(...values)=>f.writes.push(values)}}};
+ f.db={prepare(sql){return {get:()=>f.missing?undefined:({id:'fixture',email:'owner@example.test',cookies_json:f.stored,is_authenticated:f.auth??1}),run:(...values)=>{f.writes.push(values);f.sql.push(sql)}}}};
  api=await import(pathToFileURL(path.join(root,'lib/linkedin/session.ts')).href);
  guard=await import(pathToFileURL(path.join(root,'lib/linkedin/session-state.ts')).href);
  await api.closeSession('fixture');
@@ -166,4 +166,65 @@ test('readiness page opener uses only the EXISTING context, never creates one, a
  f.browser.isConnected=()=>false;
  await assert.rejects(api.getExistingContextPage('fixture',ctx),{name:'LinkedInSessionUnavailableError'});
  f.browser.isConnected=()=>true;
+});
+
+const me=JSON.stringify({miniProfile:{publicIdentifier:'fixture-member',entityUrn:'urn:li:fs_miniProfile:fixture'}});
+test('a saved login LinkedIn still serves is confirmed in-page on the feed and saved, which restores Auth',async()=>{
+ f.identity=me;f.visibleNav=false;
+ assert.equal(await api.confirmSignedIn('fixture'),'signed_in');
+ assert.deepEqual(f.navigations,['https://www.linkedin.com/feed/']);
+ assert.equal(f.writes.length,1);assert.match(f.sql[0],/is_authenticated = 1/);
+});
+test('signed-in navigation also confirms the login when the me resource is unavailable',async()=>{
+ assert.equal(await api.confirmSignedIn('fixture'),'signed_in');assert.equal(f.writes.length,1);
+});
+test('a feed answered with a sign-in page or without the login cookie is a confirmed sign-out, never saved',async()=>{
+ for(const change of [()=>{f.url='https://www.linkedin.com/login?session_redirect=synthetic'},()=>{f.url='https://www.linkedin.com/authwall'},()=>{f.url='https://www.linkedin.com/checkpoint/challenge/synthetic'},()=>{f.state={cookies:[],origins:[]}}]){
+  f.url='https://www.linkedin.com/feed/';f.state=valid();f.identity=me;change();
+  assert.equal(await api.confirmSignedIn('fixture'),'signed_out');assert.equal(f.writes.length,0);
+  await api.closeSession('fixture');
+ }
+});
+test('no evidence either way is unknown and changes nothing',async()=>{
+ f.visibleNav=false;
+ assert.equal(await api.confirmSignedIn('fixture'),'unknown');assert.equal(f.writes.length,0);
+ f.url='https://www.linkedin.com/some-interstitial/';f.visibleNav=true;f.identity=me;
+ assert.equal(await api.confirmSignedIn('fixture'),'unknown');assert.equal(f.writes.length,0);
+});
+test('an unusable saved cookie is a sign-out without any browser or navigation',async()=>{
+ f.stored=JSON.stringify({cookies:[],origins:[]});
+ assert.equal(await api.confirmSignedIn('fixture'),'signed_out');
+ assert.equal(f.navigations.length,0);assert.equal(f.contexts,0);
+});
+test('markNeedsReauth flags only a sign-out LinkedIn confirms',async()=>{
+ f.identity=me;
+ assert.equal(await api.markNeedsReauth('fixture'),false);
+ assert.ok(!f.sql.some(sql=>/is_authenticated = 0/.test(sql)));
+ f.writes.length=0;f.sql.length=0;f.visibleNav=false;f.identity=null;
+ assert.equal(await api.markNeedsReauth('fixture'),false);assert.equal(f.writes.length,0);
+ f.url='https://www.linkedin.com/login';
+ assert.equal(await api.markNeedsReauth('fixture'),true);
+ assert.deepEqual(f.sql,['UPDATE accounts SET is_authenticated = 0 WHERE id = ?']);
+});
+test('recheck route restores a confirmed login and reports only its expiry date',async()=>{
+ const handler=(await import(pathToFileURL(path.join(root,'pages/api/accounts/[id]/recheck-session.ts')).href)).default;
+ const reply=()=>({statusCode:200,status(code){this.statusCode=code;return this},json(value){this.body=value;return this},end(){return this}});
+ const expires=Math.floor(Date.now()/1000)+3600;
+ f.identity=me;f.auth=0;f.stored=JSON.stringify({cookies:[{...valid().cookies[0],expires}],origins:[]});
+ let r=reply();await handler({method:'POST',query:{id:'fixture'}},r);
+ assert.equal(r.body.status,'signed_in');assert.equal(r.body.login_expires_at,new Date(expires*1000).toISOString());
+ assert.ok(!JSON.stringify(r.body).includes('synthetic-fixture-only'));
+ assert.ok(f.sql.some(sql=>/is_authenticated = 1/.test(sql)));
+ f.sql.length=0;f.url='https://www.linkedin.com/login';await api.closeSession('fixture');
+ r=reply();await handler({method:'POST',query:{id:'fixture'}},r);
+ assert.equal(r.body.status,'signed_out');assert.deepEqual(f.sql,['UPDATE accounts SET is_authenticated = 0 WHERE id = ?']);
+ f.missing=true;r=reply();await handler({method:'POST',query:{id:'fixture'}},r);assert.equal(r.statusCode,404);
+ r=reply();await handler({method:'GET',query:{id:'fixture'}},r);assert.equal(r.statusCode,405);
+});
+test('saved login expiry is the latest usable login cookie, session cookies win, foreign ones never count',()=>{
+ const now=1_800_000_000,c=valid().cookies[0];
+ assert.equal(guard.savedLoginExpiry({cookies:[{...c,expires:now+10},{...c,expires:now+99}],origins:[]},now),now+99);
+ assert.equal(guard.savedLoginExpiry({cookies:[{...c,expires:now+10},{...c,expires:-1}],origins:[]},now),-1);
+ assert.equal(guard.savedLoginExpiry({cookies:[{...c,expires:now+10},{...c,domain:'.evil.test',expires:now+99}],origins:[]},now),now+10);
+ assert.equal(guard.savedLoginExpiry({cookies:[{...c,expires:now-1}],origins:[]},now),null);
 });

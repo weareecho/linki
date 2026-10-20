@@ -17,7 +17,7 @@ export function registerExistingPageOpener(open: ExistingPageOpener): void {
 export type IdentityObservation = { profile: string; observedAt: number; startedAt: number; isCurrent: () => boolean };
 
 export const OWN_IDENTITY_ORIGIN_URL = "https://www.linkedin.com/robots.txt";
-const OWN_IDENTITY_LIMIT = 64 * 1024;
+export const OWN_IDENTITY_LIMIT = 64 * 1024;
 
 export function canonicalProfile(raw: unknown): string | null {
   if (typeof raw !== "string") return null;

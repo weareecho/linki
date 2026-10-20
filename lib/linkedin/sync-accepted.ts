@@ -1,6 +1,7 @@
 import type { Page } from "playwright";
 import { getDb } from "@/lib/db";
 import { getSessionPage, saveSessionState, markNeedsReauth } from "@/lib/linkedin/session";
+import { isSignInWall, loginLocation } from "@/lib/linkedin/session-state";
 
 /**
  * Accepted-connection sync via the authoritative Voyager connections API.
@@ -76,8 +77,8 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
       timeout: 35000,
     });
     await page.waitForTimeout(3500 + Math.random() * 1500);
-    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(page.url())) {
-      console.warn(`[sync-accepted] Session looks logged out (${page.url()}) — skipping`);
+    if (isSignInWall(page.url())) {
+      console.warn(`[sync-accepted] Session looks logged out (${loginLocation(page.url())}) — skipping`);
       return 0;
     }
     const declaredTotal = await page.evaluate(() => {
@@ -176,8 +177,8 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
     let url = "";
     try { url = page.url(); } catch { /* gone */ }
     try { await page.close(); } catch { /* ignore */ }
-    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(url)) {
-      console.warn(`[sync-accepted] Ended on a wall (${url}) — not persisting; flagging re-auth`);
+    if (isSignInWall(url)) {
+      console.warn(`[sync-accepted] Ended on a wall (${loginLocation(url)}) — not persisting; re-checking the saved login`);
       try { await markNeedsReauth(accountId); } catch { /* ignore */ }
     } else {
       try { await saveSessionState(accountId); } catch { /* ignore */ }

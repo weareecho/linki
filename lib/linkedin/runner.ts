@@ -1,7 +1,8 @@
 import { nextAccountSlot } from "@/lib/linkedin/schedule";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
-import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
+import { getSessionPage, saveSessionState, getSessionContext, markNeedsReauth } from "@/lib/linkedin/session";
+import { LinkedInSessionUnavailableError, LinkedInSignedOutError, pageIsSignedOut } from "@/lib/linkedin/session-state";
 import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError, InvitationOutcomeUnknownError, NoteInvitationUnavailableError, hasUnresolvedInvitationOutcome, recordUnknownInvitationOutcome, clearConfirmedInvitationOutcome } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
@@ -35,6 +36,8 @@ function inmailCreditsExhaustedToday(accountId: string): boolean {
 const CONNECTION_RECHECK_HOURS = 6;
 // Max days to wait for acceptance before giving up
 const CONNECTION_MAX_WAIT_DAYS = 7;
+// A step that met a sign-in page waits this long (the account, not the person, had the problem)
+const SIGNED_OUT_RETRY_HOURS = 1;
 // Delay between profiles (seconds)
 const PROFILE_DELAY_MIN = 8;
 const PROFILE_DELAY_MAX = 20;
@@ -542,7 +545,9 @@ async function executeStep(
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
       const page = await getSessionPage(accountId);
       let visitResult: { isFirstDegree: boolean; messagingUrn: string | null };
-      try { visitResult = await visitProfile(page, linkedinUrl, target.full_name || undefined); } finally { await page.close(); }
+      try { visitResult = await visitProfile(page, linkedinUrl, target.full_name || undefined); }
+      catch (error) { if (await pageIsSignedOut(page)) throw new LinkedInSignedOutError(); throw error; }
+      finally { await page.close(); }
       await saveSessionState(accountId);
       if (visitResult.isFirstDegree && target.degree !== 1) {
         db.prepare("UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?").run(nowIso(), target.id);
@@ -595,13 +600,20 @@ async function executeStep(
         return;
       }
       const page = await getSessionPage(accountId);
+      let claimStarted = false;
       try {
         await sendConnectionRequest(page, linkedinUrl, async () => {
+          claimStarted = true;
           if (echoScope) await assertEchoEligible({ ...echoScope, profile: linkedinUrl }, "claim");
           recordUnknownInvitationOutcome(db, target.id, linkedinUrl);
         }, echoScope ? { note: echoScope.note, fullName: echoScope.full_name } : undefined, target.full_name || undefined);
+      } catch (error) {
+        // Before any claim, a sign-in page means nothing was attempted for this person.
+        if (!claimStarted && await pageIsSignedOut(page)) throw new LinkedInSignedOutError();
+        throw error;
       } finally { await page.close(); }
-      await saveSessionState(accountId);
+      // Confirmed sent: finish the bookkeeping even if refreshed cookies cannot be saved.
+      await saveSessionState(accountId).catch(() => log(db, runId, target.id, "warn", `Invitation to ${name} confirmed; LinkedIn's refreshed cookies were not saved`));
       db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
       if (echoScope) {
         await assertEchoEligible(echoScope, "complete");
@@ -987,6 +999,23 @@ async function executeStep(
       log(db, runId, target.id, "error", err.message);
       trFail(db, tr, err.message);
       db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
+      return;
+    }
+    if (err instanceof LinkedInSignedOutError || err instanceof LinkedInSessionUnavailableError) {
+      // A sign-in page is about the account, never about this person: keep the
+      // track and let LinkedIn's own feed decide whether the saved login ended.
+      // Only a confirmed sign-out flags the account, which holds every run.
+      // A flagged account's people move to random slots on the next working day,
+      // so a later login does not release them all at once.
+      const flagged = await markNeedsReauth(accountId).catch(() => false);
+      if (flagged) {
+        const slot = rescheduleToTomorrow(accountLimits);
+        trReschedule(db, tr, slot);
+        log(db, runId, target.id, "warn", `LinkedIn ended the saved login before acting for ${name}; moved to ${slot}, after the next login (Settings > Server login)`);
+      } else {
+        trWait(db, tr, SIGNED_OUT_RETRY_HOURS);
+        log(db, runId, target.id, "warn", `LinkedIn showed a sign-in page before acting for ${name}; the saved login still works, retrying in ${SIGNED_OUT_RETRY_HOURS}h`);
+      }
       return;
     }
     if (err instanceof WeeklyLimitError) {
@@ -1453,6 +1482,9 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
 
     const runStatus = db.prepare("SELECT status FROM runs WHERE id = ?").get(tr.run_id) as { status: string } | undefined;
     if (!runStatus || runStatus.status !== "running") continue;
+    // Flagged earlier in this tick (LinkedIn confirmed a sign-out): wait for the next login.
+    const account = db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(tr.account_id) as { is_authenticated: number } | undefined;
+    if (!account?.is_authenticated) continue;
 
     const target = db.prepare("SELECT * FROM targets WHERE id = ?").get(tr.target_id) as Target;
     await executeStep(db, tr.run_id, tr, target, steps, tr.account_id, limits, emailAccountId, emailLimits, getWorkflowPrompt(tr.workflow_id));
