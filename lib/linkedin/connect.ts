@@ -1,10 +1,47 @@
 import type { Locator, Page } from "playwright";
+import { mkdir, open } from "node:fs/promises";
+import { constants } from "node:fs";
+import path from "node:path";
 import type Database from "better-sqlite3";
 
 export const INVITATION_UNKNOWN_PREFIX = "Invitation outcome unknown:";
 function outcomeKeys(targetId: string, linkedinUrl?: string | null): string[] {
   const slug = linkedinUrl ? profileSlug(linkedinUrl) : null;
   return [`invitation-unknown:target:${targetId}`, ...(slug ? [`invitation-unknown:profile:${slug.toLowerCase()}`] : [])];
+}
+/** One local, private snapshot of a note-scoped invitation dialog that stopped
+ * before Send: a screenshot plus button names and textbox/recipient counts, in
+ * the private data directory. Nothing is returned, logged or retried. */
+async function captureInviteDiagnostic(page: Page, fullName: string): Promise<void> {
+  try {
+    const directory = path.join(path.dirname(process.env.LINKI_DB_PATH || path.join(process.cwd(), "linki.db")), "invite-diagnostics");
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const write = async (name: string, bytes: Buffer | string) => {
+      const file = await open(path.join(directory, name), constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+      try { await file.chmod(0o600); await file.writeFile(bytes); } finally { await file.close(); }
+    };
+    const shot = await page.screenshot({ fullPage: false, timeout: 3000 });
+    if (shot.length <= 5 * 1024 * 1024) await write("latest.png", shot);
+    const dialogs = page.getByRole("dialog");
+    const count = await dialogs.count();
+    const details = [];
+    for (let i = 0; i < Math.min(count, 3); i++) {
+      const dialog = dialogs.nth(i);
+      details.push({
+        visible: await dialog.isVisible().catch(() => false),
+        buttons: await dialog.getByRole("button").evaluateAll(elements => elements.slice(0, 20).map(element =>
+          ((element.getAttribute("aria-label") || "") + " | " + (element.textContent || "")).replace(/\s+/g, " ").trim().slice(0, 80))),
+        textboxes: await dialog.getByRole("textbox").count(),
+        exactRecipient: await dialog.getByText(fullName, { exact: true }).count(),
+        containsRecipient: (await dialog.innerText({ timeout: 1000 }).catch(() => "")).includes(fullName),
+        sendExact: await dialog.getByRole("button", { name: /^Send$/ }).count(),
+      });
+    }
+    let location = "unknown";
+    try { location = new URL(page.url()).pathname; } catch { /* no URL details */ }
+    await write("latest.json", JSON.stringify({ capturedAt: new Date().toISOString(), location, dialogs: count, details }, null, 2));
+    console.warn("[invite-check] private_diagnostic_saved=true");
+  } catch { /* Diagnostics must never turn a stopped invitation into a send. */ }
 }
 export function recordUnknownInvitationOutcome(db: Pick<Database.Database, "prepare">, targetId: string, linkedinUrl?: string | null): void {
   for (const key of outcomeKeys(targetId, linkedinUrl)) {
@@ -230,6 +267,7 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
       return await isPending(observedCard);
     })) throw new InvitationOutcomeUnknownError(true);
   } catch (error) {
+    if (approved && !sendAttempted && error instanceof TargetProfileMismatchError) await captureInviteDiagnostic(page, approved.fullName);
     if (error instanceof WeeklyLimitError || error instanceof AlreadyConnectedError || error instanceof PendingInviteError || error instanceof InvitationOutcomeUnknownError) throw error;
     if (sendAttempted) throw new InvitationOutcomeUnknownError(true);
     throw error;
