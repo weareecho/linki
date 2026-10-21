@@ -55,11 +55,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const message = err instanceof Error ? err.message : String(err);
     // A dead session surfaces as "No data intercepted" / re-auth — flag it so the runner stops.
     if (/re-authentication|No data intercepted|login|checkpoint/i.test(message)) {
+      let flagged = false;
       try {
         const { markNeedsReauth } = await import("@/lib/linkedin/session");
-        await markNeedsReauth(account.id);
+        flagged = await markNeedsReauth(account.id);
       } catch { /* ignore */ }
-      return res.status(502).json({ error: `LinkedIn session needs re-authentication: ${message}` });
+      if (flagged) return res.status(502).json({ error: `LinkedIn session needs re-authentication: ${message}` });
     }
     return res.status(500).json({ error: message });
   }

@@ -3,9 +3,9 @@ import type { Browser, BrowserContext, Page } from "playwright";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
-import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, isLinkedInLoginLanding, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState } from "@/lib/linkedin/session-state";
+import { hasUsableLinkedInState, hasSignedInLinkedInEvidence, isLinkedInLoginLanding, isSignInWall, LinkedInSessionUnavailableError, loginLocation, normalizeLegacyLinkedInState, savedLoginExpiry } from "@/lib/linkedin/session-state";
 import { captureLoginDiagnostic } from "@/lib/linkedin/session-diagnostic";
-import { existingContexts, registerExistingPageOpener } from "@/lib/linkedin/readiness-session";
+import { existingContexts, ownIdentityInPage, OWN_IDENTITY_LIMIT, profileFromOwnIdentity, registerExistingPageOpener } from "@/lib/linkedin/readiness-session";
 
 chromium.use(StealthPlugin());
 
@@ -204,16 +204,94 @@ export async function closeSession(accountId: string): Promise<void> {
   }
 }
 
+export type SessionVerdict = "signed_in" | "signed_out" | "unknown";
+export const SIGNED_IN_HOME_URL = "https://www.linkedin.com/feed/";
+
 /**
- * B4: flag an account as logged out / needing re-auth. Clears is_authenticated
- * so the runner stops working a dead session (no more 30s-timeout fail-loop),
- * and drops the live context. The user re-authenticates from Settings.
+ * Whether the SAVED login still works, decided by LinkedIn in the account's own
+ * browser context (the same fingerprint, cookies and network stack as every
+ * runner step): open the home feed once and read LinkedIn's first-party `me`
+ * resource from inside that page. Never a password, a login, a cookie export or
+ * a request from outside the browser. Only positive evidence counts:
+ *   signed_out  no usable saved cookie, or the feed answers with a sign-in page
+ *               or removes the login cookie
+ *   signed_in   the feed loads and `me` names a member (or the signed-in
+ *               navigation renders)
+ *   unknown     anything else: network error, timeout, unrecognized page
+ * A signed-in verdict saves the refreshed cookies, which also restores the
+ * account's Auth flag after an earlier sign-in signal.
  */
-export async function markNeedsReauth(accountId: string): Promise<void> {
-  const db = getDb();
-  db.prepare("UPDATE accounts SET is_authenticated = 0 WHERE id = ?").run(accountId);
+export async function confirmSignedIn(accountId: string): Promise<SessionVerdict> {
+  let page: Page;
+  try { page = await getSessionPage(accountId); }
+  catch (error) { return error instanceof LinkedInSessionUnavailableError ? "signed_out" : "unknown"; }
+  let verdict: SessionVerdict = "unknown";
+  try {
+    await page.goto(SIGNED_IN_HOME_URL, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
+    const signedOut = async () => isSignInWall(page.url()) || !hasUsableLinkedInState(await page.context().storageState());
+    if (await signedOut()) verdict = "signed_out";
+    else if (isLinkedInLoginLanding(page.url())) {
+      const raw = await page.evaluate(ownIdentityInPage, OWN_IDENTITY_LIMIT).catch(() => null);
+      if (typeof raw === "string" && profileFromOwnIdentity(raw)) verdict = "signed_in";
+      // The navigation can hydrate after DOMContentLoaded; observe, never reload.
+      const deadline = Date.now() + 10_000;
+      while (verdict === "unknown" && Date.now() < deadline) {
+        if (await signedOut()) verdict = "signed_out";
+        else if (await hasSignedInLinkedInEvidence(page)) verdict = "signed_in";
+        else await page.waitForTimeout(800);
+      }
+    }
+  } catch { /* no evidence either way */ }
+  finally { await page.close().catch(() => {}); }
+  if (verdict === "signed_in") {
+    try { await saveSessionState(accountId); } catch { return "unknown"; }
+  }
+  return verdict;
+}
+
+async function flagSignedOut(accountId: string): Promise<void> {
+  getDb().prepare("UPDATE accounts SET is_authenticated = 0 WHERE id = ?").run(accountId);
   try { await closeSession(accountId); } catch { /* ignore */ }
-  console.warn(`[session] account ${accountId} flagged needs-reauth (session logged out)`);
+  console.warn(`[session] account ${accountId} flagged needs-reauth (LinkedIn signed the saved login out)`);
+}
+
+/**
+ * B4: flag an account as logged out / needing re-auth, but only once LinkedIn
+ * confirms it (confirmSignedIn). Flagging stops every run and only a manual
+ * login used to clear it, so a sign-in page seen by one step, a failed import or
+ * a check that could not run keeps the saved login. Returns whether it flagged.
+ */
+export async function markNeedsReauth(accountId: string): Promise<boolean> {
+  const verdict = await confirmSignedIn(accountId).catch((): SessionVerdict => "unknown");
+  if (verdict !== "signed_out") {
+    console.warn(`[session] account ${accountId} saw a sign-in signal; ${verdict === "signed_in"
+      ? "LinkedIn confirms the saved login still works" : "the saved login could not be checked"} — keeping it`);
+    return false;
+  }
+  await flagSignedOut(accountId);
+  return true;
+}
+
+/** Re-checks a saved login (for example one flagged earlier) without logging in:
+ * restores the account when LinkedIn confirms it, flags it when LinkedIn says it
+ * ended, and leaves it unchanged when the check could not run. */
+export async function recheckSavedLogin(accountId: string): Promise<SessionVerdict> {
+  const verdict = await confirmSignedIn(accountId).catch((): SessionVerdict => "unknown");
+  if (verdict === "signed_out") await flagSignedOut(accountId);
+  return verdict;
+}
+
+/** When the saved login cookie lapses, as an ISO date-time ("session" for a
+ * browser-session cookie), or null. A date only, never the cookie. */
+export function savedLoginExpiresAt(accountId: string): string | null {
+  const row = getDb().prepare("SELECT cookies_json FROM accounts WHERE id = ?").get(accountId) as
+    | { cookies_json: string | null }
+    | undefined;
+  if (!row?.cookies_json) return null;
+  try {
+    const expiry = savedLoginExpiry(normalizeLegacyLinkedInState(JSON.parse(decryptSecret(row.cookies_json)!)));
+    return expiry === null ? null : expiry === -1 ? "session" : new Date(expiry * 1000).toISOString();
+  } catch { return null; }
 }
 
 /**
