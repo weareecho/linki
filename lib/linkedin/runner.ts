@@ -13,7 +13,7 @@ import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
 import { premium } from "@/lib/premium";
 import { decryptSecret } from "@/lib/crypto";
-import { assertEchoEligible, parseEchoScope, EchoEligibilityError, ECHO_GUARD_ARTIFACT_REVISION, type EchoScope } from "@/lib/linkedin/echo-guard";
+import { assertEchoEligible, parseEchoScope, EchoEligibilityError, EchoGuardUnavailableError, ECHO_PERSON_DENIALS, ECHO_GUARD_ARTIFACT_REVISION, type EchoScope } from "@/lib/linkedin/echo-guard";
 import { recordExecutorStarted, recordExecutorStopped } from "@/lib/linkedin/readiness-artifact";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
@@ -38,6 +38,12 @@ const CONNECTION_RECHECK_HOURS = 6;
 const CONNECTION_MAX_WAIT_DAYS = 7;
 // A step that met a sign-in page waits this long (the account, not the person, had the problem)
 const SIGNED_OUT_RETRY_HOURS = 1;
+// An Echo pre-action check the guard could not answer is asked again this much
+// later, up to this many consecutive times for the same track, then held.
+const ECHO_GUARD_RETRY_HOURS = 1;
+const ECHO_GUARD_MAX_RETRIES = 3;
+// This many person denials in a row in one run (no allowed check between) hold it.
+const ECHO_PERSON_DENIAL_HOLD_AT = 2;
 // Delay between profiles (seconds)
 const PROFILE_DELAY_MIN = 8;
 const PROFILE_DELAY_MAX = 20;
@@ -249,6 +255,17 @@ function trAdvance(db: ReturnType<typeof getDb>, tr: TrackRun, steps: WorkflowSt
       "UPDATE run_profile_tracks SET current_step = ?, last_step_at = datetime('now'), next_step_at = ? WHERE id = ?"
     ).run(nextIndex, nextAt, tr.id);
   }
+}
+
+// Echo retry/denial counters live in app_settings; a non-number reads as NaN and holds.
+function echoCounter(db: ReturnType<typeof getDb>, key: string): number {
+  return Number((db.prepare("SELECT value FROM app_settings WHERE key = ?").get(key) as { value: string } | undefined)?.value || 0);
+}
+function setEchoCounter(db: ReturnType<typeof getDb>, key: string, value: number) {
+  db.prepare("INSERT INTO app_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, String(value));
+}
+function clearEchoCounter(db: ReturnType<typeof getDb>, key: string) {
+  db.prepare("DELETE FROM app_settings WHERE key = ?").run(key);
 }
 
 function trWait(db: ReturnType<typeof getDb>, tr: TrackRun, hours: number) {
@@ -531,7 +548,43 @@ async function executeStep(
         list_id: run?.list_id, account_id: accountId, profile: fresh.linkedin_url,
         full_name: fresh.full_name || "", company: fresh.company || "",
       });
-      await assertEchoEligible(echoScope, "check");
+      const retryKey = `echo-guard-retry:${tr.id}`, denialKey = `echo-person-denials:${runId}`;
+      try {
+        await assertEchoEligible(echoScope, "check");
+      } catch (error) {
+        // Nothing has been visited, claimed or sent for this step yet, so a
+        // guard that could not answer is asked again later instead of holding
+        // the whole run, and a denial about this person's own outreach stops
+        // only them (a second one in a row looks systemic and holds the run).
+        // Everything else, or any failure of this bookkeeping, falls through
+        // to the run-wide hold.
+        const waitedOrStopped = (): boolean => {
+          if (error instanceof EchoGuardUnavailableError) {
+            const attempts = echoCounter(db, retryKey) + 1;
+            if (!(attempts <= ECHO_GUARD_MAX_RETRIES)) return false;
+            setEchoCounter(db, retryKey, attempts);
+            trWait(db, tr, ECHO_GUARD_RETRY_HOURS);
+            log(db, runId, target.id, "warn", `Echo eligibility check for ${name} got no answer (${error.reason}); nothing done, asking again in ${ECHO_GUARD_RETRY_HOURS}h (attempt ${attempts} of ${ECHO_GUARD_MAX_RETRIES})`);
+            return true;
+          }
+          if (error instanceof EchoEligibilityError && ECHO_PERSON_DENIALS.has(error.reason)) {
+            const denials = echoCounter(db, denialKey) + 1;
+            if (!(denials < ECHO_PERSON_DENIAL_HOLD_AT)) return false;
+            setEchoCounter(db, denialKey, denials);
+            clearEchoCounter(db, retryKey);
+            trFail(db, tr, `Echo stopped this person (${error.reason}); nothing sent`);
+            log(db, runId, target.id, "warn", `Echo stopped ${name} before any action (${error.reason}); the run continues for everyone else`);
+            return true;
+          }
+          return false;
+        };
+        let handled = false;
+        try { handled = waitedOrStopped(); } catch { handled = false; }
+        if (handled) return;
+        throw error;
+      }
+      clearEchoCounter(db, retryKey);
+      clearEchoCounter(db, denialKey);
     }
     if (step.step_type === "delay") {
       trAdvance(db, tr, steps);
@@ -990,8 +1043,11 @@ async function executeStep(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (err instanceof EchoEligibilityError) {
+      log(db, runId, target.id, "error", `Echo eligibility hold for ${name} (${err.reason}) — pausing run`);
       trFail(db, tr, err.message);
       db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(runId);
+      // A retry or resume after the owner's review starts both counts afresh.
+      try { clearEchoCounter(db, `echo-guard-retry:${tr.id}`); clearEchoCounter(db, `echo-person-denials:${runId}`); } catch { /* the hold above stands */ }
       return;
     }
     if (err instanceof InvitationOutcomeUnknownError) {
